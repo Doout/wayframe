@@ -74,7 +74,8 @@ bash scripts/benchmark.sh --managed --trace-protocol http/protobuf \
 
 Run the identical workload without `--trace-protocol` for a disabled-export baseline, and optionally
 repeat with `--trace-sample-ratio 0` to measure unsampled instrumentation. Reports record the selected
-sampling/storage mode and aggregate exported step durations. Each run still pairs direct and
+sampling/storage mode and aggregate exported step durations. Step aggregates include setup,
+warmup, and timed calls; end-to-end latency samples exclude setup/warmup. Each run still pairs direct and
 gateway calls. Comparing differences between separate runs estimates added tracing overhead;
 retain spread and CPU alongside latency. The local receiver itself consumes resources. See
 [performance methodology](performance.md) for measurement limits.

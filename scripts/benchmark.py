@@ -379,6 +379,7 @@ async def run(args):
         "method": {
             "management": "persistent" if args.managed else "static bootstrap",
             "trace_protocol": args.trace_protocol,
+            "trace_step_timings_scope": "all exported setup, warmup, and timed calls; wall time, not CPU",
             "trace_sample_ratio": args.trace_sample_ratio if args.trace_protocol else None,
             "requests_per_round": args.requests,
             "rounds": args.rounds,
