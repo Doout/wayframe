@@ -3818,7 +3818,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "jsonwebtoken",
  "rand 0.8.8",
  "reqwest 0.12.28",
@@ -3876,7 +3876,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "futures-util",
  "hex",
  "rand 0.9.5",
@@ -3992,7 +3992,7 @@ dependencies = [
 name = "wayframe-mcp"
 version = "0.1.0-alpha.1"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "http",
  "serde",
