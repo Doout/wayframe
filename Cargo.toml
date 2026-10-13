@@ -33,7 +33,7 @@ sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "io-std", "fs", "signal", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1"
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
