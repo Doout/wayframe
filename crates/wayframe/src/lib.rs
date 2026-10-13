@@ -32,6 +32,7 @@ pub use wayframe_plugins as plugins;
 pub use wayframe_resilience as resilience;
 #[cfg(feature = "routing")]
 pub use wayframe_routing as routing;
+pub use wayframe_runtime::adaptive;
 pub use wayframe_runtime::{Generation, Live, Pipeline, PublishError};
 #[cfg(feature = "transport")]
 pub use wayframe_transport as transport;

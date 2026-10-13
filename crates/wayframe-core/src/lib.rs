@@ -108,7 +108,7 @@ impl fmt::Display for PlanError {
 }
 impl std::error::Error for PlanError {}
 
-/// Validated immutable linear plan. Branches/fan-out are intentionally not v0.1.
+/// Validated immutable linear plan. Typed branching and fan-out live in the optional flow crate.
 pub struct Plan<C: Context> {
     blocks: Vec<Arc<dyn Block<C>>>,
 }

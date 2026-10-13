@@ -220,6 +220,10 @@ async fn metrics(State(app): State<App>, request: Request<Body>) -> Response {
         .collect::<std::collections::HashMap<_, _>>());
     snapshot["plugins"] = serde_json::json!(deployment.value.plugins.status());
     snapshot["generation"] = serde_json::json!(deployment.id);
+    if let Some(adaptive) = &deployment.value.adaptive {
+        let statistics = adaptive.statistics();
+        snapshot["adaptive"] = serde_json::json!({"linear_selections":statistics.linear,"graph_selections":statistics.graph});
+    }
     Json(snapshot).into_response()
 }
 #[tokio::main]

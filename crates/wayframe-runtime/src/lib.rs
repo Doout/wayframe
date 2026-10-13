@@ -6,6 +6,7 @@ use std::{
     time::Instant,
 };
 use wayframe_core::{Block, Context, Decision, Execution, Plan, PlanError};
+pub mod adaptive;
 
 pub struct Pipeline<C: Context> {
     plan: Plan<C>,

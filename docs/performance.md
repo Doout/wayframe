@@ -84,7 +84,8 @@ suite separately verifies real routing, affinity, and streaming lifetime; batch 
 ## Graph scheduling and offered load
 
 `flow_cost` measures seven repeated warm batches at 0/1/4/16/64 nodes, alongside equivalent linear
-no-op plans. Graph costs include owned outputs, dependency scheduling, limits and reports. They
+no-op plans, plus adaptive selection of each prepared path. Adaptive graph costs include context
+projection through the graph adapter; direct graph measurements reuse an immutable input. Graph costs include owned outputs, dependency scheduling, limits and reports. They
 exclude network, SDK and real policy execution. Keep this distinction when selecting a runtime.
 
 `--arrival-rate` adds fixed offered-load measurements. Latency begins at the scheduled arrival,

@@ -6,6 +6,7 @@ Wayframe is a library-first Rust framework for building gateways. Applications c
 protocol, policy blocks, listeners, and deployment model. A dependency-free core defines typed
 blocks and linear plans. Optional crates add typed async graphs, plugin factories, HTTP forwarding,
 identity and administration, routing, resilience, caching, MCP inspection, and sandboxed Wasm policies.
+Prepared adaptive boundaries choose linear or graph execution per request as work becomes known.
 
 This is an early alpha. See [security boundaries](SECURITY.md) before deploying it.
 
@@ -63,7 +64,7 @@ and [block authoring guide](docs/blocks.md).
 The reference gateway includes persistent users and rules, scoped admin roles, audit records,
 OIDC/JWKS authentication, OAuth client credentials for upstream services, named backend groups,
 health probes, tenant concurrency limits, and prepared deployment reloads. Native and Wasm plugins
-can run alongside parallel external policies. OTLP traces show each phase, graph node, queue wait,
+can run alongside external policies selected for linear or parallel execution at runtime. OTLP traces show each phase, execution choice, graph node, queue wait,
 upstream call, filter and response stream; metrics include latency histograms and plugin readiness.
 
 Frontends include HTTP/1 and HTTP/2, TLS/mTLS, HTTP over Unix sockets, and stdio. Optional WebSocket

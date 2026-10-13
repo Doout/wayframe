@@ -156,8 +156,9 @@ The original small fixture remains available through `bash scripts/demo.sh [--wa
 ## Extending the gateway
 
 Use `[[plugins]]` for native schema/redaction/CORS/cache hooks or multiple Wasm policies.
-`[[async_policies]]` runs independently prepared HTTPS authorization gates in parallel before a
-sync join and final grant checks. See [workflows](../../docs/workflows.md) and
+`[[async_policies]]` selects linear or graph execution per inspected request, using exact optional
+`operations`/`targets` selectors and `async_parallel_threshold` (default 2). Parallel gates join before
+final grant checks. Selection reasons and timings are traced. See [workflows](../../docs/workflows.md) and
 [plugins](../../docs/plugins.md) for contracts and examples.
 
 Named `[groups.<name>]` configurations use the same fields as `[load_balancer]`.

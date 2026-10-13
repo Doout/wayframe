@@ -44,7 +44,53 @@ Queued CPU closures are cancelled when their caller exits and check the deadline
 `Exclusive<T>` provides single-use ownership for a body, frame stream or other exclusive resource.
 
 `wayframe-http::workflow::FlowBlock` connects a graph through an explicit immutable projection and
-merge function. The MCP example uses this for `[[async_policies]]`: all external policies run in
+merge function. The MCP example uses this for the graph path of `[[async_policies]]`: applicable checks run in
 parallel, a sync join waits for them, and current grants are rechecked before dispatch. Live tests
 use two HTTPS policy servers and a barrier, then verify overlapping node spans from an actual OTLP
 export. `flow_cost` compares warm graph scheduling against the same number of linear no-op blocks.
+
+## Runtime path selection
+
+`wayframe::adaptive::Adaptive<C>` prepares a linear plan and a graph adapter for one phase. A short,
+trusted selector chooses a path when execution reaches that boundary, using the context produced
+by earlier steps. A linear inspection stage can reveal independent work and select the graph;
+after its join, evaluation continues with the next synchronous step. Several boundaries can make
+separate choices as more information becomes available.
+
+Both paths must implement the same required controls, with shared mandatory gates outside the
+selector. Paths must declare the same phase; mismatches fail preparation. Selection, execution and
+all child work retain the request deadline. A denial, timeout or overload is terminal; completed
+operations are never replayed to try the other path. Native selectors and adapters remain trusted.
+
+The reference gateway selects per inspected MCP operation. An external policy's optional
+`operations` and `targets` are exact selectors; empty lists apply to every operation/target.
+`async_parallel_threshold` defaults to 2. Below the threshold, applicable policies execute linearly;
+at or above it, the same policy checks execute through the prepared graph. No graph compilation or
+speculative policy call happens on the request path. Inactive graph gates return Continue, while
+every applicable gate is mandatory.
+
+```toml
+async_parallel_threshold = 2
+
+[[async_policies]]
+id = "risk"
+url = "https://policy.example/risk"
+token_env = "RISK_POLICY_TOKEN"
+operations = ["tools/call"]
+targets = ["put_note", "delete_note"]
+
+[[async_policies]]
+id = "approval"
+url = "https://policy.example/approval"
+token_env = "APPROVAL_POLICY_TOKEN"
+targets = ["delete_note"]
+```
+
+Here `put_note` selects the linear path and `delete_note` selects the graph. Authorization still
+runs before this boundary and current grants are checked again afterward. OTLP `workflow.select`
+and `workflow.path` spans record `execution.path` and `selection.reason`; graph nodes retain their
+dependency/admission/execution timings. `/metrics` reports selection counts per generation.
+
+Use measured workload costs to choose thresholds or an application selector. Tiny native operations
+often cost more to schedule than to run sequentially. Live barrier tests prove both runtime choices,
+parallel overlap and terminal denials; microbenchmarks measure selection overhead separately.

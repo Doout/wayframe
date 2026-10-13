@@ -193,11 +193,12 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
             def do_POST(self):
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 counts.append(request)
-                try:
-                    barrier.wait(timeout=2)
-                except threading.BrokenBarrierError:
-                    self.send_error(500)
-                    return
+                if request["target"] in ("admin_preview", "put_note"):
+                    try:
+                        barrier.wait(timeout=2)
+                    except threading.BrokenBarrierError:
+                        self.send_error(500)
+                        return
                 if self.hold:
                     paused.set()
                     resume.wait(timeout=2)
@@ -205,7 +206,10 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
                     {
                         "version": 1,
                         "request_id": request["request_id"],
-                        "status": 403 if self.deny and self.path == "/b" else 0,
+                        "status": 403
+                        if (self.deny and self.path == "/b")
+                        or getattr(self.server, "deny_linear", False)
+                        else 0,
                     }
                 ).encode()
                 self.send_response(200)
@@ -226,6 +230,8 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
             env = f"POLICY_{name.upper()}"
             services.env[env] = secrets.token_hex(32)
             config += f'\n[[async_policies]]\nid="policy-{name}"\nurl="https://127.0.0.1:{server.server_port}/{name}"\ntoken_env="{env}"\nca={json.dumps(str(services.certificate))}\ntimeout_ms=3000\n'
+            if name == "b":
+                config += 'targets=["admin_preview","put_note"]\n'
         services.config.write_text(config)
         services.env.update(
             OTEL_EXPORTER_OTLP_ENDPOINT=receiver.endpoint,
@@ -234,6 +240,15 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
             OTEL_BSP_SCHEDULE_DELAY="100",
         )
         await services.start()
+        from mcp_support import sdk_client
+
+        async with sdk_client(
+            services.upstream,
+            services.tokens["upstream"],
+            verify=ssl.create_default_context(cafile=str(services.certificate)),
+        ) as client:
+            seeded = await client.call_tool("put_note", {"key": "adaptive-read", "value": "ready"})
+            self.assertFalse(seeded.is_error)
         result = await self.call(services, "admin_preview", role="operator")
         self.assertEqual(result.status_code, 200, result.text)
         self.assertEqual(len(counts), 2)
@@ -255,6 +270,30 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
         a, b = by_name["policy-a"], by_name["policy-b"]
         self.assertLess(max(a["start_ns"], b["start_ns"]), min(a["end_ns"], b["end_ns"]))
         self.assertIn("node.execution_ns", a["attributes"])
+        selected = [
+            s
+            for s in receiver.spans()
+            if s["name"] == "workflow.select" and s["trace_id"] == first_trace
+        ]
+        self.assertEqual(selected[0]["attributes"]["execution.path"], "graph")
+        single = await self.call(services, "get_note", {"key": "adaptive-read"})
+        self.assertEqual(single.status_code, 200, single.text)
+        self.assertEqual(single.json()["result"]["structuredContent"]["value"], "ready")
+        self.assertEqual(len(counts), 5)  # Two graph calls, then one applicable linear policy.
+        await asyncio.sleep(0.3)
+        selected = [
+            s
+            for s in receiver.spans()
+            if s["name"] == "workflow.select"
+            and s["trace_id"] == single.headers["x-wayframe-trace-id"]
+        ]
+        self.assertEqual(selected[0]["attributes"]["execution.path"], "linear")
+        # A mandatory denial also stops the linear path without retrying the graph.
+        Policy.deny = True
+        server.deny_linear = True
+        denied = await self.call(services, "get_note", {"key": "adaptive-read"})
+        self.assertEqual(denied.status_code, 403)
+        server.deny_linear = False
         Policy.deny = False
         Policy.hold = True
         pending = asyncio.create_task(

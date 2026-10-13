@@ -36,6 +36,8 @@ pub struct Config {
     pub load_balancer: Option<LoadBalancerConfig>,
     #[serde(default)]
     pub async_policies: Vec<AsyncPolicy>,
+    #[serde(default = "default_parallel_threshold")]
+    pub async_parallel_threshold: usize,
     pub auth: Option<wayframe::auth::Config>,
     #[serde(default)]
     pub admins: Vec<AdminConfig>,
@@ -93,6 +95,13 @@ pub struct AsyncPolicy {
     pub ca: Option<String>,
     #[serde(default = "policy_timeout")]
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub operations: Vec<String>,
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+fn default_parallel_threshold() -> usize {
+    2
 }
 fn policy_timeout() -> u64 {
     1000
@@ -231,6 +240,7 @@ impl Config {
             upstream_http2: false,
             load_balancer: None,
             async_policies: vec![],
+            async_parallel_threshold: 2,
             auth: None,
             admins: vec![],
             routes: vec![],
@@ -267,6 +277,25 @@ impl Config {
         })
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (2..=16).contains(&self.async_parallel_threshold) && self.async_policies.len() <= 16,
+            "invalid adaptive policy bounds"
+        );
+        for policy in &self.async_policies {
+            ensure!(
+                policy.operations.len() <= 32
+                    && policy.targets.len() <= 256
+                    && policy
+                        .operations
+                        .iter()
+                        .all(|s| !s.is_empty() && s.len() <= 128)
+                    && policy
+                        .targets
+                        .iter()
+                        .all(|s| !s.is_empty() && s.len() <= 1024),
+                "invalid external policy selectors"
+            );
+        }
         ensure!(
             self.listen.ip().is_loopback()
                 || (std::env::var_os("WAYFRAME_TLS_CERT").is_some()

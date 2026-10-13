@@ -21,6 +21,46 @@ pub(crate) struct Deployment {
     pub(crate) groups: std::collections::HashMap<String, wayframe::lb::Pool>,
     pub(crate) _probes: Vec<wayframe::resilience::Probe>,
     pub(crate) plugins: Arc<wayframe::plugins::Bundle<RequestContext>>,
+    pub(crate) adaptive: Option<Arc<wayframe::adaptive::Adaptive<RequestContext>>>,
+}
+struct MatchedPolicy {
+    external: Arc<wayframe::transport::ExternalPolicy>,
+    operations: Vec<String>,
+    targets: Vec<String>,
+}
+impl MatchedPolicy {
+    fn applies(&self, ctx: &RequestContext) -> bool {
+        ctx.operation.as_ref().is_some_and(|operation| {
+            (self.operations.is_empty() || self.operations.contains(&operation.action))
+                && (self.targets.is_empty()
+                    || operation
+                        .target
+                        .as_ref()
+                        .is_some_and(|t| self.targets.contains(t)))
+        })
+    }
+    async fn decide(&self, ctx: &RequestContext) -> Decision {
+        if self.applies(ctx) {
+            self.external.decide(ctx).await
+        } else {
+            Decision::Continue
+        }
+    }
+}
+impl Block<RequestContext> for MatchedPolicy {
+    fn id(&self) -> &str {
+        self.external.id()
+    }
+    fn phase(&self) -> Phase {
+        Phase::Authorize
+    }
+    fn execute<'a>(&'a self, ctx: &'a mut RequestContext) -> Execution<'a> {
+        if self.applies(ctx) {
+            Execution::Deferred(Box::pin(self.external.decide(ctx)))
+        } else {
+            Execution::Immediate(Decision::Continue)
+        }
+    }
 }
 pub(crate) async fn prepare_deployment(
     config: &config::Config,
@@ -178,6 +218,7 @@ pub(crate) async fn prepare_deployment(
         managed(management::Control::Authorize),
         continuations.clone(),
     ];
+    let mut adaptive = None;
     if !config.async_policies.is_empty() {
         ensure!(
             config.async_policies.len() <= 16,
@@ -186,6 +227,7 @@ pub(crate) async fn prepare_deployment(
         let mut graph = wayframe::flow::Builder::<RequestContext>::new();
         let root = graph.input();
         let mut gates = Vec::new();
+        let mut checks = Vec::new();
         for control in &config.async_policies {
             let token = config::secret(&control.token_env)?;
             let ca = control
@@ -210,13 +252,19 @@ pub(crate) async fn prepare_deployment(
                 std::time::Duration::from_millis(control.timeout_ms),
                 ca.as_deref(),
             )?);
+            let matched = Arc::new(MatchedPolicy {
+                external,
+                operations: control.operations.clone(),
+                targets: control.targets.clone(),
+            });
+            checks.push(matched.clone());
             gates.push(graph.gate_async(
                 control.id.clone(),
                 Phase::Authorize,
                 &root,
                 move |ctx| {
-                    let external = external.clone();
-                    async move { external.decide(&ctx).await }
+                    let matched = matched.clone();
+                    async move { matched.decide(&ctx).await }
                 },
             )?);
         }
@@ -225,7 +273,14 @@ pub(crate) async fn prepare_deployment(
             graph.depends_on(&joined, gate)?;
         }
         let graph = graph.compile()?;
-        policy.push(Arc::new(wayframe::http::workflow::FlowBlock::new(
+        let linear = Pipeline::compile(
+            checks
+                .iter()
+                .cloned()
+                .map(|c| c as Arc<dyn Block<RequestContext>>)
+                .collect(),
+        )?;
+        let parallel = Arc::new(wayframe::http::workflow::FlowBlock::new(
             "parallel-policies",
             Phase::Authorize,
             graph,
@@ -237,7 +292,22 @@ pub(crate) async fn prepare_deployment(
                 view
             },
             |_, _| Decision::Continue,
-        )));
+        ));
+        let threshold = config.async_parallel_threshold;
+        let selected = Arc::new(wayframe::adaptive::Adaptive::new(
+            "adaptive-policies",
+            Phase::Authorize,
+            linear,
+            parallel,
+            move |ctx: &RequestContext| {
+                wayframe::adaptive::Selection::for_width(
+                    checks.iter().filter(|policy| policy.applies(ctx)).count(),
+                    threshold,
+                )
+            },
+        )?);
+        policy.push(selected.clone());
+        adaptive = Some(selected);
     }
     let plugins = {
         let mut configs = config.plugins.clone();
@@ -377,5 +447,6 @@ pub(crate) async fn prepare_deployment(
         groups,
         _probes: probes,
         plugins,
+        adaptive,
     })
 }
