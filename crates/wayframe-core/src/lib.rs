@@ -51,6 +51,19 @@ pub enum Execution<'a> {
     Immediate(Decision),
     Deferred(Pin<Box<dyn Future<Output = Decision> + Send + 'a>>),
 }
+/// A work result, separate from a mandatory policy decision. Owned inputs allow parallel work.
+pub enum Task<T, E> {
+    Immediate(Result<T, E>),
+    Deferred(Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'static>>),
+}
+impl<T, E> Task<T, E> {
+    pub async fn resolve(self) -> Result<T, E> {
+        match self {
+            Self::Immediate(result) => result,
+            Self::Deferred(future) => future.await,
+        }
+    }
+}
 impl Execution<'_> {
     pub async fn resolve(self) -> Decision {
         match self {
@@ -95,7 +108,7 @@ impl fmt::Display for PlanError {
 }
 impl std::error::Error for PlanError {}
 
-/// Validated immutable linear plan. Branches/fan-out are intentionally not v0.1.
+/// Validated immutable linear plan. Typed branching and fan-out live in the optional flow crate.
 pub struct Plan<C: Context> {
     blocks: Vec<Arc<dyn Block<C>>>,
 }
@@ -188,3 +201,7 @@ mod tests {
         assert!(Plan::<Work>::compile(vec![]).unwrap().is_empty());
     }
 }
+
+/// Trusted listener hook for cancelling an unresponsive transport even when a body is unpolled.
+#[derive(Clone)]
+pub struct TransportCancellation(pub std::sync::Arc<dyn Fn() + Send + Sync>);

@@ -1,0 +1,20 @@
+[package]
+name = "wayframe-plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+[lints]
+workspace = true
+[dependencies]
+wayframe-core = { path = "../wayframe-core" }
+wayframe-runtime = { path = "../wayframe-runtime" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+jsonschema = { version = "0.58", default-features = false }
+[dev-dependencies]
+wayframe-http = { path = "../wayframe-http" }

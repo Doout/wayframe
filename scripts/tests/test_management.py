@@ -352,14 +352,23 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
                         "rate",
                         "mcp-envelope",
                         "tool-permissions",
+                        "mcp-continuation-owner",
                         "tool-rate",
+                        "current-grants",
+                        "current-continuation-owner",
                         "upstream-path",
                     },
                 )
                 for span in trace:
                     self.assertGreaterEqual(span["end_ns"], span["start_ns"])
                     if span is not root:
-                        self.assertEqual(span["parent_id"], root["span_id"])
+                        by_id = {s["span_id"]: s for s in trace}
+                        parent = span
+                        while (
+                            parent["parent_id"] in by_id and parent["parent_id"] != root["span_id"]
+                        ):
+                            parent = by_id[parent["parent_id"]]
+                        self.assertEqual(parent["parent_id"], root["span_id"])
                         self.assertGreaterEqual(span["start_ns"], root["start_ns"])
                         self.assertLessEqual(span["end_ns"], root["end_ns"], span["name"])
                 self.assertTrue(

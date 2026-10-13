@@ -10,12 +10,11 @@ publish = false
 workspace = true
 
 [dependencies]
-wayframe = { path = "../../crates/wayframe", features = ["http", "controls", "mcp", "otel", "lb"] }
+wayframe = { path = "../../crates/wayframe", features = ["http", "controls", "mcp", "otel", "lb", "management", "flow", "listeners", "observability", "routing", "resilience", "auth", "plugins", "transport", "codec", "policies"] }
 anyhow.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 toml.workspace = true
@@ -23,17 +22,10 @@ reqwest.workspace = true
 futures-util.workspace = true
 base64.workspace = true
 
-fs2 = "0.4"
-arc-swap.workspace = true
 sha2.workspace = true
 hex.workspace = true
 subtle.workspace = true
 rand.workspace = true
-opentelemetry.workspace = true
-opentelemetry_sdk.workspace = true
-opentelemetry-otlp.workspace = true
-tracing-opentelemetry.workspace = true
-
 [features]
 default = []
 wasm = ["wayframe/wasm"]

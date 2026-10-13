@@ -41,6 +41,8 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:8080")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("show")
+    sub.add_parser("deployment")
+    sub.add_parser("reload")
     for command in ("create-user", "update-user", "apply-rules"):
         action = sub.add_parser(command)
         action.add_argument("file", type=Path, help="JSON profile or rules file")
@@ -66,6 +68,15 @@ def main():
         parser.error("set WAYFRAME_ADMIN_TOKEN")
     url = args.url.rstrip("/")
     try:
+        if args.command in {"deployment", "reload"}:
+            state = call(url, token, "GET", "/admin/deployment")
+            result = (
+                state
+                if args.command == "deployment"
+                else call(url, token, "POST", "/admin/reload", revision=state["generation"])
+            )
+            print(json.dumps(result, indent=2))
+            return 0
         state = call(url, token, "GET", "/admin/state")
         if args.command == "show":
             result = state

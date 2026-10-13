@@ -116,6 +116,15 @@ pub struct ExternalPolicy {
     timeout: Duration,
 }
 impl ExternalPolicy {
+    pub async fn decide(&self, ctx: &RequestContext) -> Decision {
+        let request = PolicyRequest::from_context(ctx);
+        let deadline = ctx.deadline.min(tokio::time::Instant::now() + self.timeout);
+        match timeout_at(deadline, self.call(&request)).await {
+            Ok(Ok(reply)) => response_decision(reply, request.request_id)
+                .unwrap_or_else(|_| Decision::unavailable()),
+            _ => Decision::unavailable(),
+        }
+    }
     #[cfg(unix)]
     pub fn unix(id: String, path: PathBuf, expected_uid: u32, timeout: Duration) -> Result<Self> {
         ensure!(path.is_absolute(), "Unix socket paths must be absolute");
@@ -205,15 +214,7 @@ impl Block<RequestContext> for ExternalPolicy {
         Phase::Authorize
     }
     fn execute<'a>(&'a self, ctx: &'a mut RequestContext) -> Execution<'a> {
-        Execution::Deferred(Box::pin(async move {
-            let request = PolicyRequest::from_context(ctx);
-            let deadline = ctx.deadline.min(tokio::time::Instant::now() + self.timeout);
-            match timeout_at(deadline, self.call(&request)).await {
-                Ok(Ok(reply)) => response_decision(reply, request.request_id)
-                    .unwrap_or_else(|_| Decision::unavailable()),
-                _ => Decision::unavailable(),
-            }
-        }))
+        Execution::Deferred(Box::pin(async move { self.decide(ctx).await }))
     }
 }
 
@@ -418,3 +419,7 @@ mod task_tests {
         assert_eq!(work.value, 1);
     }
 }
+
+pub mod network;
+#[cfg(unix)]
+pub mod stdio;

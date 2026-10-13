@@ -38,8 +38,8 @@ The upstream credential is optional and must be distinct from all client credent
 
 The example reader can read notes; the operator can write/delete them, inspect maintenance
 statistics, and read gateway metrics. Tool authorization uses the inspected JSON body.
-Unknown tools and unsupported operations are denied. Tool discovery currently returns the
-upstream's full catalog; it does not hide denied tools.
+Unknown tools and unsupported operations are denied. Tool, resource and prompt discovery is
+filtered against the caller's current grants, including permission edits and denied-tool rules.
 
 `notes.toml` contains no secrets. Configuration rejects unknown fields, invalid identities,
 ambiguous endpoint paths, and unbounded limits. Optional settings are:
@@ -53,9 +53,9 @@ ambiguous endpoint paths, and unbounded limits. Optional settings are:
 | `allowed_origins`, `allowed_hosts` | Exact loopback listener values |
 | `upstream_ca` | Public trust roots; add a PEM CA file for a private server |
 
-TLS certificate and hostname verification remain enabled. TCP listeners bind loopback; use a
-TLS ingress for remote clients. Service bearer tokens are supported; OAuth discovery and JWKS
-refresh are separate deployment work.
+TLS certificate and hostname verification remain enabled. TCP listeners default to loopback;
+non-loopback listeners require configured TLS. The gateway supports service bearer tokens,
+JWKS-backed resource-server authentication and independent upstream OAuth client credentials.
 
 ## Frontends and execution boundaries
 
@@ -65,6 +65,9 @@ refresh are separate deployment work.
 | HTTP over a Unix socket | Same HTTP semantics; socket mode 0600 and bearer authentication |
 | MCP stdio | Newline-delimited JSON-RPC; streams SSE messages back to the local client |
 | HTTPS upstream | Verified TLS with public or configured private CA roots |
+| TLS/mTLS frontend | Verified TLS, optional client certificates, HTTP/1 and HTTP/2 |
+| Supervised stdio upstream | Isolated child credentials, bounded calls, cancellation and progress |
+| Custom WebSocket/framed TCP | Bounded message bindings through the same authorization path |
 
 For a Unix socket on macOS/Linux:
 
@@ -96,8 +99,8 @@ DELETE or upstream 404. The registry is bounded to 4096 entries and is local to 
 Restarting the gateway invalidates its session ownership records; clients must initialize again.
 
 The framework also exposes native calls, bounded task bridges, Unix policy RPC, HTTPS policy RPC,
-and Wasm policies. These are execution boundaries, distinct from MCP wire transports. Raw TCP,
-QUIC, UDP, WebSocket, and arbitrary distributed message transports are not implemented.
+and Wasm policies. These are execution boundaries, distinct from MCP wire transports. Bounded custom TCP/WebSocket bindings are available alongside standard MCP transports. QUIC, UDP
+and shared-memory adapters remain separate expansion points. See [transport contracts](../../docs/transports.md).
 
 ## Wasm policy
 
@@ -115,13 +118,15 @@ terminal. Compilation and clean-instance preparation finish before a listener is
 [Load-balancing setup](../../docs/load-balancing.md) covers all four routing strategies and the
 complete [two-replica configuration](notes-lb.toml). The same TCP/Unix/stdio frontends route to
 registered endpoints, preserving backend credentials, TLS verification, and legacy session affinity.
-Reservations remain active until response disposal; passive cooldown affects subsequent calls.
+Reservations remain active until response disposal; active probes and passive cooldown affect
+subsequent calls. Local deadlines and downstream cancellation do not eject healthy backends.
 
 ## Operational endpoints
 
 `GET /healthz` reports listener liveness; it does not probe upstream health. `GET /metrics` requires
 a configured client with `gateway:metrics` permission and returns request, active, denial,
-overload, upstream-error, and byte counters. Neither endpoint is forwarded upstream.
+overload, upstream-error, byte counters, latency histograms and plugin status. `/readyz` checks
+required identity/plugin/backend resources. These endpoints are not forwarded upstream.
 
 ## Users, controls, and traces
 
@@ -146,3 +151,36 @@ and parser failures, Unix/stdio frontends, trusted/untrusted TLS, and Wasm denia
 See [performance methodology](../../docs/performance.md) and [MCP scope](../../docs/mcp-profile.md).
 
 The original small fixture remains available through `bash scripts/demo.sh [--wasm]`.
+
+
+## Extending the gateway
+
+Use `[[plugins]]` for native schema/redaction/CORS/cache hooks or multiple Wasm policies.
+`[[async_policies]]` selects linear or graph execution per inspected request, using exact optional
+`operations`/`targets` selectors and `async_parallel_threshold` (default 2). Parallel gates join before
+final grant checks. Selection reasons and timings are traced. See [workflows](../../docs/workflows.md) and
+[plugins](../../docs/plugins.md) for contracts and examples.
+
+Named `[groups.<name>]` configurations use the same fields as `[load_balancer]`.
+`[[routes]]` entries select a group using exact/prefix path, optional hosts/methods/tenants and
+verified operations/targets. Backend IDs must be globally unique. Unmatched routes deny; an owned
+session/task pins a registered backend and never silently fails over. A backend's `hard_limit`
+is a hard in-flight cap independent of quota-priority overflow. `health_path` and
+`health_interval_ms` enable active bounded probes. `tenant_concurrency` rejects excess requests
+before body collection. See [routing and balancing](../../docs/load-balancing.md).
+
+Enable TLS using `WAYFRAME_TLS_CERT` and `WAYFRAME_TLS_KEY`; add `WAYFRAME_TLS_CLIENT_CA` to require
+verified client certificates. Bearer/JWT authorization remains required. Non-loopback listeners
+require TLS. The private admin listener stays loopback-only.
+
+OIDC configuration uses an explicit `[auth]` issuer, audience/resource URI, `jwks_uri`,
+`tenant_claim`, `permissions_claim` and `[auth.permission_map]`. The gateway publishes protected-resource
+metadata at the root and MCP well-known path and challenges unauthorized clients. It does not run
+an authorization server. Optional `[upstream_oauth]` or backend `oauth` configuration specifies a
+fixed HTTPS `token_endpoint`, `client_id`, private `secret_file`, `resource`, `scopes`, and optional
+CA file. Provider tokens are refreshed independently; caller tokens are never exchanged.
+
+For operations, [scoped administration](../../docs/management.md) and
+[prepared reloads](../../docs/reloads.md) cover audit files, ETags, credential/certificate changes,
+rollback and the settings that require restart. `scripts/admin.py deployment` and `reload` are the
+corresponding CLI operations.

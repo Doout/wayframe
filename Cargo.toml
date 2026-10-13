@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "crates/wayframe", "crates/wayframe-core", "crates/wayframe-runtime",
   "crates/wayframe-http", "crates/wayframe-blocks", "crates/wayframe-transport",
-  "crates/wayframe-mcp", "crates/wayframe-lb", "crates/wayframe-wasm", "examples/mcp-gateway",
+  "crates/wayframe-mcp", "crates/wayframe-lb", "crates/wayframe-wasm", "crates/wayframe-flow", "crates/wayframe-management", "crates/wayframe-listeners", "crates/wayframe-codec", "crates/wayframe-plugins", "crates/wayframe-routing", "crates/wayframe-resilience", "crates/wayframe-auth", "crates/wayframe-observability", "crates/wayframe-cache", "examples/mcp-gateway", "crates/wayframe-policies",
 ]
 default-members = ["crates/wayframe", "crates/wayframe-core", "crates/wayframe-runtime"]
 exclude = ["plugins/path-control"]
@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "io-std", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "io-std", "fs", "signal", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.8"
 tracing = "0.1"

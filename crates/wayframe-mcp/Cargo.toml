@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 wayframe-core = { path = "../wayframe-core" }
+wayframe-codec = { path = "../wayframe-codec" }
 wayframe-http = { path = "../wayframe-http" }
 serde.workspace = true
 serde_json.workspace = true

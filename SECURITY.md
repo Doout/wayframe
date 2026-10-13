@@ -25,10 +25,12 @@ Native blocks can execute arbitrary process code and must be trusted. A cooperat
 is not a process kill. Host compilation can consume resources and cannot be preempted by dropping
 its async caller. A malicious runtime exploit is outside WIT capability isolation. Use distinct,
 unprivileged OS processes/containers with owned cgroups, network policy and filesystem isolation
-for mutually hostile tenants or untrusted compiler inputs. The package does not implement that
-supervisor or claim total CPU/RSS/process-tree containment.
+for mutually hostile tenants or untrusted compiler inputs. The stdio supervisor bounds its own child and pending calls; it does not claim total process-tree,
+container or hostile-compiler containment.
 
-SHA-256 plus a trusted manifest detects mismatched artifacts; it does not authenticate the publisher.
+SHA-256 detects artifact mismatches. Optional Ed25519 trust authenticates the publisher and binds
+the manifest limits/grants; remote HTTPS loading requires it. Publisher trust does not grant
+additional host capabilities.
 The loader admits operator-owned regular files with relative component paths and bounded reads;
 it is not a hardened shared writable artifact store. Do not let tenants replace files, directories
 or manifests. There is no unsafe native-AOT deserialization cache in this version.
@@ -36,23 +38,23 @@ or manifests. There is no unsafe native-AOT deserialization cache in this versio
 The example supports independent development tokens and optional managed users with hashed
 random bearer tokens, rotation/revocation, an authenticated admin API, and local persistent rules.
 Management uses a distinct credential, revision preconditions, bounded private files, and one
-process per state file; it is not OAuth or a distributed identity store. Never commit them. Do not
+process per state file; it is a local control plane rather than a distributed identity store. Never commit them. Do not
 reuse client tokens for an upstream service, accept client-supplied `x-*` identity headers, or grant
-permissions from MCP `clientInfo` or annotations. JWT support uses one configured RS256 public key
-and explicit issuer/audience validation; there is no OIDC discovery or JWKS refresh and JWT claims
-do not automatically grant the demo's tool permissions.
+permissions from MCP `clientInfo` or annotations. The reusable identity adapter validates RS256 signatures, issuer/audience/expiry, refreshes bounded
+JWKS, and maps only explicitly trusted claims into permissions. Protected-resource metadata and
+separate upstream OAuth client credentials are available; the gateway is not an authorization server.
 
-The example Axum listener does not impose a pre-header hard socket cap or ingress TLS. Its
-in-flight request budget does not replace connection/slow-client controls. Put proper ingress,
-OS resource budgets, downstream deadlines and audit controls in place before public deployment.
+The listener supports TLS/mTLS, connection/HTTP2 admission, handshake/header/I/O deadlines and
+bounded draining. Expired request transports are cancelled even when body polling is backpressured.
+Native callbacks must cooperate with cancellation; use the CPU pool for blocking work.
 The original standard-library Python server is a read-only fixture. The SDK notes server is a
 loopback persistence example; its shared database is not partitioned by tenant. Neither example
 is a hardened production HTTP service.
 
 Load-balanced endpoints are operator registered; client metadata cannot select arbitrary URLs.
 MCP sessions pin their backend and fail closed when unavailable. Dispatch is never retried.
-Local connection quotas guide routing and intentionally allow last-backend overflow; they are not
-a hard admission cap or distributed quota. Active health probes/shared quota stores are not included.
+Quota-priority preferences allow overflow, while separate hard backend caps remain enforced.
+Active health probes and single half-open admission are local; shared quota stores are not included.
 
 Per-stream byte pacing is not aggregate bandwidth enforcement. Per-process limits multiply across
 replicas. Bodies exceeding a limit after response headers are sent terminate the stream. Work with

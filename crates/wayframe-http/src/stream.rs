@@ -3,7 +3,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::{header::HeaderName, HeaderMap};
 use std::sync::atomic::Ordering;
-use std::{io, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::time::{sleep_until, timeout_at, Instant};
 
 /// Conservative path contract shared by policies and routing. Ambiguous encodings are rejected.
@@ -77,8 +77,34 @@ pub fn strip_client_identity(headers: &mut HeaderMap) {
     for n in names {
         headers.remove(n);
     }
-    for n in ["authorization", "forwarded", "host"] {
+    for n in ["authorization", "cookie", "forwarded", "host"] {
         headers.remove(n);
+    }
+}
+/// Error provenance is retained so gateway budgets do not eject healthy upstreams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamError {
+    Deadline,
+    PacingDeadline,
+    SizeLimit,
+    Filter,
+    Source(String),
+}
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deadline => f.write_str("body deadline"),
+            Self::PacingDeadline => f.write_str("pacing deadline"),
+            Self::SizeLimit => f.write_str("body size limit exceeded"),
+            Self::Filter => f.write_str("response filter failed"),
+            Self::Source(_) => f.write_str("body source failed"),
+        }
+    }
+}
+impl std::error::Error for StreamError {}
+impl StreamError {
+    pub fn is_source_failure(&self) -> bool {
+        matches!(self, Self::Source(_))
     }
 }
 /// Bounded body stream with per-direction, per-stream pacing. It does not buffer full payloads.
@@ -89,38 +115,152 @@ pub fn constrained<S, E>(
     deadline: Instant,
     metrics: Arc<Metrics>,
     outbound: bool,
-) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
+) -> impl Stream<Item = Result<Bytes, StreamError>> + Send
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
     async_stream::try_stream! {
         tokio::pin!(source);
-        let mut total = 0u64; let mut scheduled = Instant::now();
+        let mut total = 0u64;
+        let mut scheduled = Instant::now();
         loop {
-            let item = timeout_at(deadline, source.next()).await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "body deadline"))?;
-            let Some(item) = item else { break; };
-            let mut data = item.map_err(|e| io::Error::other(e.to_string()))?;
-            total = total.checked_add(data.len() as u64).ok_or_else(|| io::Error::other("body size overflow"))?;
-            if total > maximum { Err(io::Error::other("body size limit exceeded"))?; }
+            let item = timeout_at(deadline, source.next())
+                .await
+                .map_err(|_| StreamError::Deadline)?;
+            let Some(item) = item else {
+                break;
+            };
+            let mut data = item.map_err(|e| StreamError::Source(e.to_string()))?;
+            total = total
+                .checked_add(data.len() as u64)
+                .ok_or(StreamError::SizeLimit)?;
+            if total > maximum {
+                Err(StreamError::SizeLimit)?;
+            }
             while !data.is_empty() {
                 let chunk = data.split_to(data.len().min(16 * 1024));
                 if bytes_per_second != 0 {
-                    scheduled = scheduled.max(Instant::now()) + Duration::from_secs_f64(chunk.len() as f64 / bytes_per_second as f64);
-                    timeout_at(deadline, sleep_until(scheduled)).await
-                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "pacing deadline"))?;
+                    scheduled = scheduled.max(Instant::now())
+                        + Duration::from_secs_f64(chunk.len() as f64 / bytes_per_second as f64);
+                    timeout_at(deadline, sleep_until(scheduled))
+                        .await
+                        .map_err(|_| StreamError::PacingDeadline)?;
                 }
-                if outbound { metrics.bytes_out.fetch_add(chunk.len() as u64, Ordering::Relaxed); }
-                else { metrics.bytes_in.fetch_add(chunk.len() as u64, Ordering::Relaxed); }
+                if outbound {
+                    metrics
+                        .bytes_out
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                } else {
+                    metrics
+                        .bytes_in
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
                 yield chunk;
             }
+        }
+    }
+}
+/// Preserve HTTP/2 and gRPC trailers while applying the same body budgets.
+pub fn constrained_frames<B>(
+    body: B,
+    maximum: u64,
+    rate: u64,
+    deadline: Instant,
+    metrics: Option<Arc<Metrics>>,
+) -> impl Stream<Item = Result<http_body::Frame<Bytes>, StreamError>> + Send
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::fmt::Display + Send,
+{
+    use http_body_util::BodyExt;
+    async_stream::try_stream! {
+        tokio::pin!(body);
+        let mut total = 0u64;
+        let mut scheduled = Instant::now();
+        let mut trailers_seen = false;
+        while let Some(frame) = timeout_at(deadline, body.frame())
+            .await
+            .map_err(|_| StreamError::Deadline)?
+        {
+            let frame = frame.map_err(|e| StreamError::Source(e.to_string()))?;
+            match frame.into_data() {
+                Ok(mut data) => {
+                    if trailers_seen {
+                        Err(StreamError::Filter)?;
+                    }
+                    total = total
+                        .checked_add(data.len() as u64)
+                        .ok_or(StreamError::SizeLimit)?;
+                    if total > maximum {
+                        Err(StreamError::SizeLimit)?;
+                    }
+                    while !data.is_empty() {
+                        let chunk = data.split_to(data.len().min(16384));
+                        if rate != 0 {
+                            scheduled = scheduled.max(Instant::now())
+                                + Duration::from_secs_f64(chunk.len() as f64 / rate as f64);
+                            timeout_at(deadline, sleep_until(scheduled))
+                                .await
+                                .map_err(|_| StreamError::PacingDeadline)?;
+                        }
+                        if let Some(metrics) = &metrics {
+                            metrics
+                                .bytes_in
+                                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        }
+                        yield http_body::Frame::data(chunk);
+                    }
+                }
+                Err(frame) => {
+                    if let Ok(mut trailers) = frame.into_trailers() {
+                        if trailers_seen
+                            || trailers.len() > 128
+                            || trailers
+                                .iter()
+                                .map(|(k, v)| k.as_str().len() + v.as_bytes().len())
+                                .sum::<usize>()
+                                > 16384
+                        {
+                            Err(StreamError::SizeLimit)?;
+                        }
+                        trailers_seen = true;
+                        strip_hop_headers(&mut trailers);
+                        strip_client_identity(&mut trailers);
+                        yield http_body::Frame::trailers(trailers);
+                    }
+                }
+            }
+        }
+    }
+}
+/// A synchronized polling wrapper allows streaming request bodies in reqwest without buffering.
+pub struct FrameBody<S>(std::sync::Mutex<std::pin::Pin<Box<S>>>);
+impl<S> FrameBody<S> {
+    pub fn new(stream: S) -> Self {
+        Self(std::sync::Mutex::new(Box::pin(stream)))
+    }
+}
+impl<S> http_body::Body for FrameBody<S>
+where
+    S: Stream<Item = Result<http_body::Frame<Bytes>, StreamError>> + Send,
+{
+    type Data = Bytes;
+    type Error = StreamError;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, StreamError>>> {
+        match self.0.lock() {
+            Ok(mut stream) => stream.as_mut().poll_next(cx),
+            Err(_) => std::task::Poll::Ready(Some(Err(StreamError::Filter))),
         }
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     #[test]
     fn ambiguous_paths_are_rejected() {
         for p in [

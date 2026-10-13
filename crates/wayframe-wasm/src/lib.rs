@@ -36,7 +36,7 @@ fn w<T>(r: wasmtime::Result<T>) -> Result<T> {
     r.map_err(|e| anyhow!("{e}"))
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub name: String,
@@ -50,6 +50,75 @@ pub struct Manifest {
     pub fuel: u64,
     pub timeout_ms: u64,
     pub init_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<ArtifactSignature>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactSignature {
+    pub key_id: String,
+    pub ed25519: String,
+}
+pub struct Trust {
+    pub keys: std::collections::BTreeMap<String, ed25519_dalek::VerifyingKey>,
+    pub capabilities: std::collections::BTreeSet<String>,
+}
+impl Trust {
+    pub fn from_hex(
+        keys: &std::collections::BTreeMap<String, String>,
+        capabilities: std::collections::BTreeSet<String>,
+    ) -> Result<Self> {
+        ensure!(
+            !keys.is_empty() && keys.len() <= 64 && capabilities.len() <= 6,
+            "invalid publisher trust bounds"
+        );
+        let mut trusted = std::collections::BTreeMap::new();
+        for (id, hex) in keys {
+            ensure!(
+                !id.is_empty() && id.len() <= 64 && hex.len() == 64,
+                "invalid publisher key"
+            );
+            let key: [u8; 32] = hex::decode(hex)?
+                .try_into()
+                .map_err(|_| anyhow!("invalid public key size"))?;
+            trusted.insert(id.clone(), ed25519_dalek::VerifyingKey::from_bytes(&key)?);
+        }
+        Ok(Self {
+            keys: trusted,
+            capabilities,
+        })
+    }
+}
+impl Manifest {
+    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        let mut payload = self.clone();
+        payload.signature = None;
+        Ok(serde_json::to_vec(&payload)?)
+    }
+    pub fn verify(&self, trust: &Trust) -> Result<()> {
+        let signature = self
+            .signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("publisher signature required"))?;
+        ensure!(
+            signature.key_id.len() <= 64 && signature.ed25519.len() == 128,
+            "invalid artifact signature"
+        );
+        let key = trust
+            .keys
+            .get(&signature.key_id)
+            .ok_or_else(|| anyhow!("untrusted publisher"))?;
+        let bytes = hex::decode(&signature.ed25519)?;
+        let signature = ed25519_dalek::Signature::from_slice(&bytes)?;
+        key.verify_strict(&self.signing_bytes()?, &signature)?;
+        ensure!(
+            self.capabilities
+                .iter()
+                .all(|cap| trust.capabilities.contains(cap)),
+            "publisher requested an unapproved capability"
+        );
+        Ok(())
+    }
 }
 impl Manifest {
     pub fn validate(&self) -> Result<()> {
@@ -158,6 +227,56 @@ pub struct Runtime {
     _epoch: EpochDriver,
 }
 impl Runtime {
+    /// Download a signed manifest/component from one fixed HTTPS registry origin.
+    /// Signatures approve publisher identity; the operator's capability grant remains mandatory.
+    pub async fn load_remote(self: &Arc<Self>, url: &str, trust: &Trust) -> Result<Arc<Pool>> {
+        let url: reqwest::Url = url.parse()?;
+        ensure!(
+            url.scheme() == "https"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "registry must use HTTPS without URL credentials"
+        );
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(15))
+            .build()?;
+        async fn fetch(client: &reqwest::Client, url: reqwest::Url, max: usize) -> Result<Vec<u8>> {
+            let mut response = client.get(url).send().await?.error_for_status()?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                ensure!(
+                    bytes.len().saturating_add(chunk.len()) <= max,
+                    "registry download limit"
+                );
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
+        }
+        let text = fetch(&client, url.clone(), 16384).await?;
+        let manifest: Manifest = toml::from_str(std::str::from_utf8(&text)?)?;
+        manifest.validate()?;
+        manifest.verify(trust)?;
+        let component_url = url.join(&manifest.component)?;
+        ensure!(
+            component_url.origin() == url.origin()
+                && component_url.query().is_none()
+                && component_url.fragment().is_none(),
+            "component must remain within registry origin"
+        );
+        let bytes = fetch(&client, component_url, MAX_COMPONENT).await?;
+        let digest = hex::encode(Sha256::digest(&bytes));
+        ensure!(
+            digest.eq_ignore_ascii_case(&manifest.sha256),
+            "registry artifact digest mismatch"
+        );
+        let component = self.compile(&digest, bytes).await?;
+        Pool::prepare(self.clone(), component, manifest).await
+    }
     pub fn new() -> Result<Arc<Self>> {
         let mut allocation = PoolingAllocationConfig::default();
         allocation
@@ -216,9 +335,19 @@ impl Runtime {
         Ok(component)
     }
     pub async fn load(self: &Arc<Self>, manifest_path: &Path) -> Result<Arc<Pool>> {
+        self.load_with_trust(manifest_path, None).await
+    }
+    pub async fn load_with_trust(
+        self: &Arc<Self>,
+        manifest_path: &Path,
+        trust: Option<&Trust>,
+    ) -> Result<Arc<Pool>> {
         let text = bounded_read(manifest_path, 16 * 1024).await?;
         let manifest: Manifest = toml::from_str(std::str::from_utf8(&text)?)?;
         manifest.validate()?;
+        if let Some(trust) = trust {
+            manifest.verify(trust)?;
+        }
         let parent = manifest_path.parent().unwrap_or(Path::new("."));
         let path = parent.join(&manifest.component);
         let bytes = bounded_read(&path, MAX_COMPONENT).await?;
@@ -529,6 +658,7 @@ mod tests {
             fuel: 100_000,
             timeout_ms: 50,
             init_timeout_ms: 500,
+            signature: None,
         }
     }
     fn context() -> RequestContext {
@@ -610,8 +740,9 @@ mod failure_tests {
             warm_instances: 1,
             memory_mib: 2,
             fuel: 100_000,
-            timeout_ms: 20,
+            timeout_ms: 200,
             init_timeout_ms: 500,
+            signature: None,
         }
     }
     fn context(path: &str) -> RequestContext {
@@ -646,6 +777,38 @@ mod failure_tests {
         })
         .await
         .unwrap();
+    }
+    #[test]
+    fn publisher_signature_binds_digest_limits_version_and_grants() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::RngCore;
+        let mut secret = [0u8; 32];
+        rand::rng().fill_bytes(&mut secret);
+        let signer = SigningKey::from_bytes(&secret);
+        let mut m = manifest();
+        m.signature = Some(ArtifactSignature {
+            key_id: "publisher".into(),
+            ed25519: hex::encode(signer.sign(&m.signing_bytes().unwrap()).to_bytes()),
+        });
+        let trust = Trust {
+            keys: [("publisher".into(), signer.verifying_key())].into(),
+            capabilities: m.capabilities.iter().cloned().collect(),
+        };
+        assert!(m.verify(&trust).is_ok());
+        let mut tampered = m.clone();
+        tampered.fuel += 1;
+        assert!(tampered.verify(&trust).is_err());
+        let mut tampered = m.clone();
+        tampered.sha256 = "ff".repeat(32);
+        assert!(tampered.verify(&trust).is_err());
+        let mut missing = m.clone();
+        missing.signature = None;
+        assert!(missing.verify(&trust).is_err());
+        let restricted = Trust {
+            keys: trust.keys,
+            capabilities: Default::default(),
+        };
+        assert!(m.verify(&restricted).is_err());
     }
     #[tokio::test]
     async fn invalid_decision_fails_closed_and_replenishes() {

@@ -41,7 +41,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             tools = await client.list_tools()
             self.assertEqual(
                 {t.name for t in tools.tools},
-                {"get_note", "put_note", "delete_note", "admin_preview"},
+                {"get_note"},
             )
             result = await client.call_tool("get_note", {"key": "hello"})
             self.assertFalse(result.is_error)

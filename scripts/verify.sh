@@ -19,6 +19,9 @@ cargo fmt --all -- --check
 cargo fmt --manifest-path plugins/path-control/Cargo.toml -- --check
 cargo check --locked -p wayframe --no-default-features
 cargo check --locked -p wayframe --no-default-features --features lb
+cargo check --locked -p wayframe --no-default-features --features flow
+cargo check --locked -p wayframe --no-default-features --features plugins
+cargo check --locked -p wayframe --no-default-features --features codec
 cargo test --locked --workspace --all-features --all-targets
 cargo test --locked --workspace --all-features --doc
 cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
@@ -27,4 +30,5 @@ python3 scripts/smoke.py | tee "$report_dir/gateway-smoke.json"
 cargo build --locked -p wayframe-example-mcp-gateway --features wasm
 python3 scripts/smoke.py --wasm | tee "$report_dir/wasm-smoke.json"
 python3 -m unittest discover -s scripts/tests -v
+cargo run --locked -p wayframe --no-default-features --features mcp,codec --example boundary_fuzz > "$report_dir/boundary-mutations.json"
 cargo tree --locked --workspace > "$report_dir/dependencies.txt"

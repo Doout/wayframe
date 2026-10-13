@@ -41,6 +41,9 @@ pub struct Backend {
     pub priority: u32,
     #[serde(default = "enabled")]
     pub enabled: bool,
+    /// Hard per-process reservation ceiling, independent of quota-priority preference. Zero disables it.
+    #[serde(default)]
+    pub hard_limit: u32,
 }
 fn one() -> u32 {
     1
@@ -56,6 +59,7 @@ impl Backend {
             quota: 0,
             priority: 0,
             enabled: true,
+            hard_limit: 0,
         }
     }
 }
@@ -73,6 +77,7 @@ impl fmt::Display for SelectError {
 }
 impl std::error::Error for SelectError {}
 struct Entry {
+    probe_healthy: bool,
     enabled: bool,
     unavailable_until: Option<Instant>,
     epoch: u64,
@@ -118,6 +123,7 @@ impl Pool {
                 || !ids.insert(&b.id)
                 || !(1..=1_000_000).contains(&b.weight)
                 || b.quota > 1_000_000
+                || b.hard_limit > 1_000_000
             {
                 return Err("invalid/duplicate backend id, weight or quota".into());
             }
@@ -125,6 +131,7 @@ impl Pool {
         let entries = backends
             .iter()
             .map(|b| Entry {
+                probe_healthy: true,
                 enabled: b.enabled,
                 unavailable_until: None,
                 epoch: 0,
@@ -154,6 +161,21 @@ impl Pool {
         entry.current_weight = 0;
         Ok(())
     }
+    pub fn set_available(&self, id: &str, healthy: bool) -> Result<(), SelectError> {
+        let i = self
+            .0
+            .backends
+            .iter()
+            .position(|b| b.id == id)
+            .ok_or(SelectError::NoBackends)?;
+        self.0
+            .state
+            .lock()
+            .map_err(|_| SelectError::Poisoned)?
+            .entries[i]
+            .probe_healthy = healthy;
+        Ok(())
+    }
     pub fn snapshot(&self) -> Result<Vec<BackendStats>, SelectError> {
         let state = self.0.state.lock().map_err(|_| SelectError::Poisoned)?;
         let now = Instant::now();
@@ -165,7 +187,7 @@ impl Pool {
             .map(|(b, e)| BackendStats {
                 id: b.id.clone(),
                 enabled: e.enabled,
-                healthy: e.unavailable_until.is_none_or(|until| until <= now),
+                healthy: e.probe_healthy && e.unavailable_until.is_none_or(|until| until <= now),
                 active: e.active,
                 selected: e.selected,
                 failures: e.failures,
@@ -182,9 +204,12 @@ impl Pool {
         let now = Instant::now();
         let eligible = |i: usize, state: &State| {
             state.entries[i].enabled
+                && state.entries[i].probe_healthy
+                && (self.0.backends[i].hard_limit == 0
+                    || state.entries[i].active < self.0.backends[i].hard_limit as u64)
                 && state.entries[i]
                     .unavailable_until
-                    .is_none_or(|until| until <= now)
+                    .is_none_or(|until| until <= now && state.entries[i].active == 0)
         };
         let mut indices = [0usize; 128];
         let mut n = 0;
@@ -415,6 +440,25 @@ mod tests {
             Backend::new("c"),
         ])
         .unwrap()
+    }
+    #[test]
+    fn hard_caps_active_probes_and_single_half_open_probe_are_enforced() {
+        let mut backend = Backend::new("one");
+        backend.hard_limit = 1;
+        let pool = Pool::new(vec![backend]).unwrap();
+        let lease = pool.select(Strategy::RoundRobin, None).unwrap();
+        assert!(pool.select(Strategy::RoundRobin, None).is_err());
+        lease.failed(Duration::from_millis(1));
+        drop(lease);
+        std::thread::sleep(Duration::from_millis(5));
+        let probe = pool.select(Strategy::RoundRobin, None).unwrap();
+        assert!(pool.select(Strategy::RoundRobin, None).is_err());
+        probe.succeeded();
+        drop(probe);
+        pool.set_available("one", false).unwrap();
+        assert!(pool.select(Strategy::RoundRobin, None).is_err());
+        pool.set_available("one", true).unwrap();
+        assert!(pool.select(Strategy::RoundRobin, None).is_ok());
     }
     #[test]
     fn round_robin_and_least_connections_rotate_ties() {
