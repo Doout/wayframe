@@ -459,15 +459,19 @@ async def run(args):
             (args.output / "policy-boundaries.json").write_text(result.stdout)
         finally:
             services.close()
-        micro = await asyncio.to_thread(
-            subprocess.run,
-            [str(ROOT / "target/release/examples/pipeline_cost")],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        (args.output / "native-pipeline.json").write_text(micro.stdout)
+        for example, filename in [
+            ("pipeline_cost", "native-pipeline.json"),
+            ("lb_cost", "native-load-balancer.json"),
+        ]:
+            micro = await asyncio.to_thread(
+                subprocess.run,
+                [str(ROOT / "target/release/examples" / example)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            (args.output / filename).write_text(micro.stdout)
     if any(s["error_count"] for s in report["scenarios"]):
         raise RuntimeError(
             "benchmark recorded failures; inspect error_count/raw errors before interpreting latency"

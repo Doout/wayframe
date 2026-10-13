@@ -121,6 +121,8 @@ cargo run --locked --release -p wayframe --no-default-features --features lb --e
 This isolates native selection and final lease release in repeated pipeline batches over 2, 8,
 and 64 backends, with a separate empty-plan baseline. It validates selection totals and zero active
 reservations afterward. It excludes network, MCP, TLS, exporter, and saturation effects.
-`bash scripts/benchmark.sh` also saves this report in `target/benchmarks/native-load-balancer.json`.
+`bash scripts/benchmark.sh` also saves this report alongside the other measurements, normally in
+`target/benchmarks/native-load-balancer.json`. `--output` changes the destination; `--skip-boundaries`
+skips the native/policy microbenchmarks.
 Use the full gateway workload to measure network/application effects; native batch timing alone
 is not a capacity measurement or production latency guarantee.
