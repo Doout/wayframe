@@ -42,7 +42,9 @@ do not automatically grant the demo's tool permissions.
 The example Axum listener does not impose a pre-header hard socket cap or ingress TLS. Its
 in-flight request budget does not replace connection/slow-client controls. Put proper ingress,
 OS resource budgets, downstream deadlines and audit controls in place before public deployment.
-The Python server is a read-only loopback test fixture, not a hardened production HTTP server.
+The original standard-library Python server is a read-only fixture. The SDK notes server is a
+loopback persistence example; its shared database is not partitioned by tenant. Neither example
+is a hardened production HTTP service.
 
 Per-stream byte pacing is not aggregate bandwidth enforcement. Per-process limits multiply across
 replicas. Bodies exceeding a limit after response headers are sent terminate the stream. Work with

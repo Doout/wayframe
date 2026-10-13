@@ -1,107 +1,172 @@
-//! Reference application. No gateway executable is installed by the framework.
-use anyhow::{ensure, Context as _, Result};
+//! Configurable reference gateway, embedded in an application rather than installed by the framework.
+mod config;
+mod session;
+mod stdio;
+use anyhow::{ensure, Result};
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::Request,
+    http::{Request, StatusCode},
     response::Response,
     routing::{get, post},
     Json, Router,
 };
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 use wayframe::{
     controls::{BearerTokens, OriginGuard, RateLimit},
-    http::{HttpGateway, Identity, Limits, RequestContext},
+    http::{rejection, HttpGateway, Identity, Operation, RequestContext},
     mcp::{McpGuard, ToolPermissions},
     prelude::*,
 };
 
-fn secret(name: &str) -> Result<String> {
-    let value = std::env::var(name)
-        .with_context(|| format!("set {name}; see examples/mcp-gateway/README.md"))?;
-    ensure!(
-        value.len() >= 32 && value.len() <= 8192 && !value.contains(char::is_whitespace),
-        "invalid credential in {name}"
-    );
-    Ok(value)
+struct UpstreamPath(String);
+impl Block<RequestContext> for UpstreamPath {
+    fn id(&self) -> &str {
+        "upstream-path"
+    }
+    fn phase(&self) -> Phase {
+        Phase::Dispatch
+    }
+    fn execute<'a>(&'a self, ctx: &'a mut RequestContext) -> Execution<'a> {
+        ctx.path.clone_from(&self.0);
+        Execution::Immediate(Decision::Continue)
+    }
+}
+#[derive(Clone)]
+struct App {
+    gateway: Arc<HttpGateway>,
+    auth: Arc<BearerTokens>,
+    sessions: Arc<session::Sessions>,
+}
+impl App {
+    async fn forward(&self, peer: SocketAddr, request: Request<Body>) -> Response {
+        let old_session = request
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let deleting = request.method() == "DELETE";
+        let mut response = self.gateway.handle(peer, request).await;
+        if response.status() == StatusCode::METHOD_NOT_ALLOWED
+            && !response.headers().contains_key("allow")
+        {
+            response
+                .headers_mut()
+                .insert("allow", "POST".parse().expect("literal"));
+        }
+        if let Some(new_session) = response.headers().get("mcp-session-id") {
+            let Some(identity) = response.extensions().get::<Identity>() else {
+                return rejection(Reason::Unavailable, "session_registration_failed");
+            };
+            let initialize = response
+                .extensions()
+                .get::<Operation>()
+                .is_some_and(|op| op.action == "initialize");
+            let valid = new_session.to_str().ok().is_some_and(|id| {
+                if let Some(old) = &old_session {
+                    id == old
+                } else {
+                    response.status().is_success() && initialize && self.sessions.bind(id, identity)
+                }
+            });
+            if !valid {
+                return rejection(Reason::Unavailable, "session_registration_failed");
+            }
+        }
+        if let Some(id) = old_session {
+            if response.status() == StatusCode::NOT_FOUND
+                || (deleting && response.status().is_success())
+            {
+                self.sessions.remove(&id);
+            }
+        }
+        response
+    }
 }
 async fn handle(
-    State(gateway): State<Arc<HttpGateway>>,
+    State(app): State<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response {
-    gateway.handle(peer, request).await
+    app.forward(peer, request).await
+}
+async fn metrics(State(app): State<App>, request: Request<Body>) -> Response {
+    let mut ctx = RequestContext::new(
+        request.method().clone(),
+        "/metrics".into(),
+        "127.0.0.1".parse().expect("literal"),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
+    ctx.headers = request.headers().clone();
+    let decision = app.auth.execute(&mut ctx).resolve().await;
+    if let Decision::Deny { reason, code } = decision {
+        return rejection(reason, code);
+    }
+    if !ctx
+        .identity
+        .is_some_and(|i| i.permissions.contains("gateway:metrics"))
+    {
+        return rejection(Reason::Forbidden, "metrics_not_permitted");
+    }
+    use axum::response::IntoResponse;
+    Json(app.gateway.metrics().snapshot()).into_response()
 }
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let listen: SocketAddr = std::env::var("WAYFRAME_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:8080".into())
-        .parse()?;
+    let config = config::Config::load()?;
+    let transport = std::env::var("WAYFRAME_TRANSPORT").unwrap_or_else(|_| "http".into());
     ensure!(
-        listen.ip().is_loopback(),
-        "the example only exposes loopback HTTP; terminate TLS before public use"
+        matches!(transport.as_str(), "http" | "stdio"),
+        "WAYFRAME_TRANSPORT must be http or stdio"
     );
-    let upstream =
-        std::env::var("WAYFRAME_UPSTREAM").unwrap_or_else(|_| "http://127.0.0.1:9001".into());
-    let reader = secret("WAYFRAME_READER_TOKEN")?;
-    let operator = secret("WAYFRAME_OPERATOR_TOKEN")?;
-    let upstream_token = secret("WAYFRAME_UPSTREAM_TOKEN")?;
     ensure!(
-        reader != operator && reader != upstream_token && operator != upstream_token,
-        "all three credentials must be distinct"
+        transport != "stdio" || std::env::var_os("WAYFRAME_UNIX_SOCKET").is_none(),
+        "select either stdio or a Unix socket"
     );
-    let origins = vec![
-        format!("http://127.0.0.1:{}", listen.port()),
-        format!("http://localhost:{}", listen.port()),
-    ];
+    let config::Credentials {
+        clients,
+        upstream_token,
+    } = config.credentials()?;
+    let (origin, path) = config.endpoint()?;
+    let auth = Arc::new(BearerTokens::new("auth".into(), clients).map_err(anyhow::Error::msg)?);
+    let sessions = Arc::new(session::Sessions::new());
     let preflight = Pipeline::compile(vec![
-        Arc::new(OriginGuard::new("origin".into(), origins).map_err(anyhow::Error::msg)?)
-            as Arc<dyn Block<RequestContext>>,
         Arc::new(
-            BearerTokens::new(
-                "auth".into(),
-                vec![
-                    (
-                        reader,
-                        Identity::new("reader", "demo").with_permissions(["tools:read"]),
-                    ),
-                    (
-                        operator,
-                        Identity::new("operator", "demo")
-                            .with_permissions(["tools:read", "tools:admin"]),
-                    ),
-                ],
+            OriginGuard::new("origin".into(), config.allowed_origins.clone())
+                .map_err(anyhow::Error::msg)?,
+        ) as Arc<dyn Block<RequestContext>>,
+        auth.clone(),
+        sessions.clone(),
+        Arc::new(
+            RateLimit::new(
+                "rate".into(),
+                config.requests_per_second,
+                config.burst,
+                config.clients.len(),
             )
             .map_err(anyhow::Error::msg)?,
         ),
-        Arc::new(RateLimit::new("rate".into(), 10.0, 20, 128).map_err(anyhow::Error::msg)?),
     ])?;
     let mut policy: Vec<Arc<dyn Block<RequestContext>>> = vec![
         Arc::new(
-            McpGuard::new("mcp-envelope".into(), 32768)
+            McpGuard::new("mcp-envelope".into(), config.max_request_bytes)
                 .map_err(anyhow::Error::msg)?
-                .allow_legacy(true),
+                .allow_legacy(true)
+                .allow_sessions(true),
         ),
         Arc::new(
-            ToolPermissions::new(
-                "tool-permissions".into(),
-                HashMap::from([
-                    ("add".into(), "tools:read".into()),
-                    ("search_docs".into(), "tools:read".into()),
-                    ("admin_preview".into(), "tools:admin".into()),
-                ]),
-            )
-            .map_err(anyhow::Error::msg)?,
+            ToolPermissions::new("tool-permissions".into(), config.tools.clone())
+                .map_err(anyhow::Error::msg)?,
         ),
     ];
     #[cfg(feature = "wasm")]
     if let Ok(path) = std::env::var("WAYFRAME_PLUGIN_MANIFEST") {
-        // Compilation and clean instance preparation finish BEFORE binding the listener.
         let runtime = wayframe::wasm::Runtime::new()?;
         let pool = runtime.load(std::path::Path::new(&path)).await?;
         policy.push(Arc::new(wayframe::wasm::WasmBlock::new(
@@ -112,40 +177,102 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "wasm"))]
     ensure!(
         std::env::var_os("WAYFRAME_PLUGIN_MANIFEST").is_none(),
-        "rebuild the example with --features wasm to load a plugin"
+        "build with --features wasm to load a plugin"
     );
-    // Keep this mutable for the optional plugin, without imposing a feature on native builds.
-    let _ = &mut policy;
-    let gateway = HttpGateway::builder(upstream)
+    policy.push(Arc::new(UpstreamPath(path)));
+    let mut builder = HttpGateway::builder(origin)
         .preflight(preflight)
         .policy(Pipeline::compile(policy)?)
-        .inspect_body(32768)
-        .limits(Limits {
-            max_request_bytes: 32768,
-            max_response_bytes: 1024 * 1024,
-            request_timeout: Duration::from_secs(15),
-            ..Limits::default()
-        })
-        .authorities(vec![
-            format!("127.0.0.1:{}", listen.port()),
-            format!("localhost:{}", listen.port()),
-        ])
-        .upstream_bearer(upstream_token)
-        .build()?;
-    let app = Router::new()
-        .route("/mcp", post(handle))
-        .route(
-            "/healthz",
-            get(|| async {
-                Json(serde_json::json!({"ready":true,"example":"wayframe-mcp-gateway"}))
-            }),
+        .inspect_body(config.max_request_bytes)
+        .limits(config.limits())
+        .authorities(config.allowed_hosts.clone());
+    if let Some(token) = upstream_token {
+        builder = builder.upstream_bearer(token);
+    }
+    if let Some(ca) = config.ca()? {
+        builder = builder.upstream_ca(ca);
+    }
+    let gateway = builder.build()?;
+    let app = App {
+        gateway: gateway.clone(),
+        auth,
+        sessions,
+    };
+    if transport == "stdio" {
+        let token = config::secret("WAYFRAME_LOCAL_TOKEN")?;
+        stdio::run(
+            app,
+            token,
+            config.max_request_bytes,
+            config.max_response_bytes as usize,
+            &config.allowed_hosts[0],
         )
-        .with_state(gateway.clone());
-    let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!(%listen,"MCP reference gateway ready (loopback development profile)");
+        .await?;
+        return Ok(());
+    }
+    if let Ok(path) = std::env::var("WAYFRAME_UNIX_SOCKET") {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = std::path::PathBuf::from(path);
+            ensure!(
+                path.is_absolute() && !path.exists(),
+                "Unix socket must be an unused absolute path"
+            );
+            let listener = tokio::net::UnixListener::bind(&path)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            struct SocketCleanup(std::path::PathBuf);
+            impl Drop for SocketCleanup {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+            let _cleanup = SocketCleanup(path);
+            let router = router()
+                .route(
+                    "/mcp",
+                    post(|State(app): State<App>, req: Request<Body>| async move {
+                        app.forward("127.0.0.1:0".parse().expect("literal"), req)
+                            .await
+                    })
+                    .get(|State(app): State<App>, req: Request<Body>| async move {
+                        app.forward("127.0.0.1:0".parse().expect("literal"), req)
+                            .await
+                    })
+                    .delete(
+                        |State(app): State<App>, req: Request<Body>| async move {
+                            app.forward("127.0.0.1:0".parse().expect("literal"), req)
+                                .await
+                        },
+                    ),
+                )
+                .with_state(app);
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    stop_signal().await;
+                    gateway.stop_admission();
+                })
+                .await?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            anyhow::bail!("Unix sockets are not supported on this platform");
+        }
+    }
+    ensure!(
+        std::env::var("WAYFRAME_TRANSPORT").map_or(true, |t| t == "http"),
+        "WAYFRAME_TRANSPORT must be http or stdio"
+    );
+    let router = router()
+        .route("/mcp", post(handle).get(handle).delete(handle))
+        .with_state(app);
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    tracing::info!(listen = %config.listen, "MCP gateway ready");
     axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        router.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         stop_signal().await;
@@ -153,6 +280,14 @@ async fn main() -> Result<()> {
     })
     .await?;
     Ok(())
+}
+fn router() -> Router<App> {
+    Router::new()
+        .route(
+            "/healthz",
+            get(|| async { Json(serde_json::json!({"alive":true})) }),
+        )
+        .route("/metrics", get(metrics))
 }
 async fn stop_signal() {
     #[cfg(unix)]

@@ -127,6 +127,16 @@ impl ExternalPolicy {
         })
     }
     pub fn https(id: String, url: &str, token: String, timeout: Duration) -> Result<Self> {
+        Self::https_with_ca(id, url, token, timeout, None)
+    }
+    /// Trust an operator-provided CA while retaining TLS hostname and chain validation.
+    pub fn https_with_ca(
+        id: String,
+        url: &str,
+        token: String,
+        timeout: Duration,
+        ca: Option<&[u8]>,
+    ) -> Result<Self> {
         let url: reqwest::Url = url.parse()?;
         ensure!(
             url.scheme() == "https"
@@ -139,12 +149,16 @@ impl ExternalPolicy {
             token.len() >= 32 && !timeout.is_zero(),
             "invalid policy token or timeout"
         );
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .https_only(true)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(timeout)
-            .build()?;
+            .timeout(timeout);
+        if let Some(ca) = ca {
+            ensure!(ca.len() <= 64 * 1024, "CA file too large");
+            client = client.add_root_certificate(reqwest::Certificate::from_pem(ca)?);
+        }
+        let client = client.build()?;
         Ok(Self {
             id,
             endpoint: Endpoint::Https { url, token, client },

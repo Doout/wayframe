@@ -28,9 +28,14 @@ jobs:
           rustup show active-toolchain
       - name: Verify source, libraries, optional plugins, and live gateway
         run: bash scripts/verify.sh
+      - name: Check benchmark harness
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/benchmark.sh --requests 100 --rounds 1 --concurrency 1 --payloads 64 --formats json --native-only --skip-boundaries
       - name: Upload verification reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: verification-${{ matrix.os }}
-          path: target/verification/
+          path: |
+            target/verification/
+            target/benchmarks/

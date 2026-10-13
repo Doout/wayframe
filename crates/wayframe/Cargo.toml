@@ -28,3 +28,11 @@ wasm = ["http", "dep:wayframe-wasm"]
 
 [dev-dependencies]
 tokio.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+tokio-util.workspace = true
+
+[[example]]
+name = "policy_cost"
+required-features = ["http", "transport", "wasm"]

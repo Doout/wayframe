@@ -2861,7 +2861,11 @@ dependencies = [
 name = "wayframe"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "bytes",
+ "futures-util",
+ "serde_json",
  "tokio",
+ "tokio-util",
  "wayframe-blocks",
  "wayframe-core",
  "wayframe-http",
@@ -2895,8 +2899,13 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "futures-util",
+ "reqwest",
+ "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "wayframe",

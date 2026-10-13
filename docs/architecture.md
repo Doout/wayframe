@@ -67,7 +67,9 @@ forwarding. Body mutation through the inspection context is not a supported tran
 the bytes sent upstream remain the inspected original body.
 
 The path policy conservatively rejects ambiguous encodings, encoded separators, double-decoding,
-dot segments and control characters. Policy evaluation and forwarding use the same canonical path.
+dot segments and control characters. The HTTP adapter forwards the final canonical path in the context. A trusted application dispatch
+block can map an approved client path to a fixed upstream path; the MCP application maps `/mcp`
+to its configured endpoint. Earlier controls inspect the incoming path and verified operation.
 Hop-by-hop headers, client authorization and spoofable forwarding/identity headers are removed.
 A separately configured gateway-to-upstream credential can be attached. The HTTP client disables
 ambient proxies and redirects. The upstream origin is operator-owned, not a request-selected URL.

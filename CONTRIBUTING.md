@@ -15,14 +15,14 @@ bash scripts/verify.sh
 ```
 
 This checks formatting, Python lint and fixture tests, the native facade, all workspace features
-and targets, doctests, Clippy, and both live gateway modes. Reports are written to
+and targets, doctests, Clippy, both fixture gateway modes, and official SDK integration tests. Reports are written to
 `target/verification/` and uploaded by CI. GitHub Actions runs verification on Linux and macOS.
 
 Format changes before running verification:
 
 ```bash
 cargo fmt --all
-python3 -m ruff format scripts examples/mcp-server
+python3 -m ruff format scripts examples/mcp-server examples/notes-server
 ```
 
 Commit intentional dependency updates with the resulting Cargo.lock. CI checks formatting without

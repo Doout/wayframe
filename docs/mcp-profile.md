@@ -1,82 +1,59 @@
-# MCP showcase: deliberately scoped interoperability
+# MCP interoperability
 
-The core framework is protocol-independent. `wayframe-mcp` is an optional inspection/policy
-adapter, and `examples/mcp-server/server.py` is a small executable fixture, **not a full MCP SDK**.
-The current official specification inspected for this package is dated **2026-07-28**.
-The demo also implements a stateless subset of **2025-11-25** for legacy clients.
+The core framework is protocol-independent. `wayframe-mcp` adds bounded JSON-RPC inspection and
+tool authorization. The configurable gateway is tested against the official Python MCP SDK
+2.3.0 as both client and server. Its notes example performs real persisted SQLite operations.
+The original standard-library fixture remains useful for malformed-envelope tests.
 
 ## Supported profile
 
-| Capability | 2026-07-28 | 2025-11-25 compatibility |
+| Capability | 2026-07-28 | 2025-11-25 |
 | --- | --- | --- |
-| HTTP endpoint | POST `/mcp` | POST `/mcp` |
-| Discovery/lifecycle | `server/discover`; per-request metadata | `initialize`, then `notifications/initialized` |
-| Operations | `ping`, `tools/list`, `tools/call` | Same |
-| Responses | JSON and request-scoped SSE progress + final result | JSON and request-scoped SSE |
-| State | No protocol session | No session ID is assigned |
-| GET stream / DELETE session | 405 | 405; neither feature used |
-| Tool inventory | Three bundled, read-only tools | Same |
+| Lifecycle | `server/discover`, per-request metadata | `initialize`, `notifications/initialized` |
+| Methods | `ping`, `tools/list`, `tools/call` | Same plus cancellation notification |
+| HTTP transport | POST with JSON or SSE results | POST, session GET and DELETE |
+| Sessions | Stateless requests | IDs bound to authenticated tenant/subject |
+| HTTP over Unix socket | Supported | Supported |
+| MCP stdio adapter | Supported | Owns upstream session for the local client |
+| Upstream TLS | Verified public/private CA roots | Same |
 
-Modern requests send `MCP-Protocol-Version`, `Mcp-Method` and, for `tools/call`, `Mcp-Name`.
-The body carries `params._meta.io.modelcontextprotocol/protocolVersion` and client capabilities.
-The gateway parses the bounded body and compares the mirrored values before extracting an
-operation. Base64-sentinel names are decoded first. A header declaring `add` cannot hide a body
-calling `admin_preview`. Legacy policy reads the body too; it never authorizes solely on optional
-legacy headers.
+Modern requests carry protocol-version and capability metadata. Mirrored method/name headers must
+agree with the bounded JSON body. Base64-sentinel names are decoded before comparison. Legacy
+requests are also authorized from their body, rather than optional headers. Duplicate JSON keys,
+ambiguous headers, excessive envelopes, invalid IDs, and mismatched targets are rejected.
 
-Modern successful results include `resultType: complete` and server identity metadata. The
-upstream emits protocol JSON-RPC errors where applicable; gateway policy failures may be plain
-HTTP error JSON, as permitted for intermediaries. Protocol-level error details are not implemented
-in the generic core `Decision` type.
+Authenticated identities and permissions come from operator configuration. Each tool has an
+explicit required permission; unknown tools and other operations are denied. `tools/list` exposes
+the upstream catalog, including tools the caller cannot execute. The upstream service credential
+is distinct from every client credential, and client authorization/identity headers are stripped
+before forwarding. A Wasm continue decision cannot override a native denial.
 
-The example client supports these built-in tools only. It is not a complete schema-driven MCP
-client and does not implement arbitrary `x-mcp-header` tool annotations or OAuth negotiation.
-The listed tools do not declare such annotations.
+Legacy sessions use a bounded gateway ownership registry. Another identity cannot POST, GET,
+or DELETE using a session it does not own. Upstream expiration and successful DELETE remove the
+record. Ownership is local to a gateway process; clients reinitialize after gateway restart.
 
-## Tools and permissions
+## Validation
 
-`add` accepts two bounded numbers. `search_docs` searches five included snippets, not a directory
-or remote URL. `admin_preview` returns a simulated maintenance description and makes no change.
-All three are read-only; tool annotations are descriptive hints, not access-control authority.
+`scripts/verify.sh` runs the real Rust gateway and SDK server/client to check:
 
-The gateway's authenticated identities grant `tools:read` and optionally `tools:admin`.
-`tools/list` exposes the complete demonstration catalog; denied tools are not hidden. All
-execution permission checks are enforced on `tools/call`. The upstream service token authorizes
-the gateway to the fixture; it is different from either client token. The fixture is not a separate
-per-user authorization engine and must not be exposed as an unauthenticated bypass.
+- Writes, reads, revisions, and persistence after upstream restart.
+- SSE progress followed by the committed structured result, and JSON responses.
+- TCP, Unix socket, and stdio frontends; trusted and untrusted HTTPS upstream certificates.
+- Native/guest tool denials, client/upstream credential separation, Host/Origin checks, malformed
+  envelopes, request-size limits, unknown tools, and cross-identity session reuse.
 
-The optional Wasm plugin is defense in depth: it denies `admin_preview` for everyone, including
-an operator. The native permission check still runs first and cannot be overridden by the guest.
+This qualifies the documented tools profile. Resources, prompts, elicitation, sampling, client
+responses to server requests, extensions, batch calls, resumable SSE, OAuth discovery, and general
+bidirectional server-initiated stdio requests are not implemented by this application. Upstream
+servers requiring those capabilities need additional adapters and authorization rules.
 
-## Bounds and exclusions
-
-The fixture limits envelopes to 32 KiB, JSON depth to 64, JSON nodes to 4096, metadata to 16 KiB,
-and request IDs/target lengths. Duplicate keys and duplicate security metadata headers are rejected.
-The Python fixture accepts bounded Content-Length requests and closes each response connection.
-The gateway normalizes inspected request framing, including originally chunked bodies. These are
-intentional demonstration choices, not maximum-throughput claims.
-
-No batch calls, prompts, resources, sampling, elicitation, roots, subscriptions, notifications from
-extensions, resumable SSE, protocol session management, full MCP OAuth, SSE GET endpoint,
-transparent uploads, tool retries, or arbitrary server-side actions are provided. One request-scoped
-progress event is emitted when a tool call includes `_meta.progressToken`; the work itself is small
-and immediate. The client buffers at most 1 MiB for its display parser, while the Rust gateway
-streams response chunks.
-
-The example binds loopback, checks exact Host and present Origin, and uses development bearer
-credentials. It is not ready to be configured as a public remote MCP endpoint in an arbitrary AI
-client. Public deployments need production ingress, an appropriate identity provider, protected
-resource discovery/authorization, credential audience checks and host resource hardening.
+The listener binds loopback; public deployment requires ingress TLS and production identity,
+connection, and resource controls. See [gateway setup](../examples/mcp-gateway/README.md) and
+[security boundaries](../SECURITY.md).
 
 ## References
 
-- [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
+- [Official Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+- [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28)
 - [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http)
-- [Discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)
-- [Versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
-- [Metadata](https://modelcontextprotocol.io/specification/2026-07-28/basic/metadata)
-- [Tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
-- [Authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
-- [2025-11-25 transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
-
-Fixture tests cover the supported profile. Independent SDK interoperability remains unverified.
+- [2025-11-25 transport and sessions](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)

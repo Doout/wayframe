@@ -31,6 +31,7 @@ use wayframe_runtime::Pipeline;
 pub const fn status_for(reason: Reason) -> u16 {
     match reason {
         Reason::InvalidInput => 400,
+        Reason::MethodNotAllowed => 405,
         Reason::Unauthenticated => 401,
         Reason::Forbidden => 403,
         Reason::NotFound => 404,
@@ -170,6 +171,7 @@ pub struct GatewayBuilder {
     inspection_bytes: Option<usize>,
     authorities: Vec<String>,
     upstream_token: Option<String>,
+    upstream_ca: Option<Vec<u8>>,
 }
 impl GatewayBuilder {
     pub fn new(origin: impl Into<String>) -> Self {
@@ -181,6 +183,7 @@ impl GatewayBuilder {
             inspection_bytes: None,
             authorities: Vec::new(),
             upstream_token: None,
+            upstream_ca: None,
         }
     }
     /// Authentication and cheap admission run before collecting a body.
@@ -212,6 +215,11 @@ impl GatewayBuilder {
         self.upstream_token = Some(token);
         self
     }
+    /// Trust an operator-provided CA in addition to the public roots; certificate checks remain enabled.
+    pub fn upstream_ca(mut self, pem: Vec<u8>) -> Self {
+        self.upstream_ca = Some(pem);
+        self
+    }
     pub fn build(self) -> Result<Arc<HttpGateway>> {
         self.limits.validate()?;
         let origin: reqwest::Url = self.origin.parse()?;
@@ -237,12 +245,16 @@ impl GatewayBuilder {
                 "invalid upstream token"
             );
         }
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(3))
-            .pool_max_idle_per_host(32)
-            .build()?;
+            .pool_max_idle_per_host(32);
+        if let Some(pem) = self.upstream_ca {
+            ensure!(pem.len() <= 64 * 1024, "CA file too large");
+            client = client.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
+        }
+        let client = client.build()?;
         Ok(Arc::new(HttpGateway {
             origin: origin.as_str().trim_end_matches('/').into(),
             preflight: self
@@ -452,6 +464,12 @@ impl HttpGateway {
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = status;
         *response.headers_mut() = headers;
+        if let Some(identity) = ctx.identity {
+            response.extensions_mut().insert(identity);
+        }
+        if let Some(operation) = ctx.operation {
+            response.extensions_mut().insert(operation);
+        }
         response
     }
 }

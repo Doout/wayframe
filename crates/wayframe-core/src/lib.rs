@@ -14,6 +14,7 @@ pub trait Context: Send + 'static {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     InvalidInput,
+    MethodNotAllowed,
     Unauthenticated,
     Forbidden,
     NotFound,

@@ -136,6 +136,7 @@ fn valid_id(v: &Value) -> bool {
 pub struct McpGuard {
     id: String,
     legacy: bool,
+    sessions: bool,
     maximum: usize,
 }
 impl McpGuard {
@@ -146,6 +147,7 @@ impl McpGuard {
         Ok(Self {
             id,
             legacy: false,
+            sessions: false,
             maximum,
         })
     }
@@ -153,8 +155,39 @@ impl McpGuard {
         self.legacy = enabled;
         self
     }
+    /// Enable handshake-era GET/DELETE forwarding. The application must enforce session ownership.
+    pub fn allow_sessions(mut self, enabled: bool) -> Self {
+        self.sessions = enabled;
+        self
+    }
     fn inspect(&self, ctx: &mut RequestContext) -> Decision {
         ctx.operation = None;
+        if matches!(ctx.method.as_str(), "GET" | "DELETE")
+            && header(ctx, "mcp-protocol-version") != Ok(Some(LEGACY_VERSION))
+        {
+            return Decision::deny(Reason::MethodNotAllowed, "mcp_method_not_supported");
+        }
+        if self.sessions && self.legacy && matches!(ctx.method.as_str(), "GET" | "DELETE") {
+            if header(ctx, "mcp-protocol-version") != Ok(Some(LEGACY_VERSION))
+                || !matches!(header(ctx, "mcp-session-id"), Ok(Some(id)) if !id.is_empty() && id.len() <= 512 && id.bytes().all(|b| (0x21..=0x7e).contains(&b)))
+            {
+                return bad("mcp_session_required");
+            }
+            if ctx.method.as_str() == "GET"
+                && !matches!(header(ctx, "accept"), Ok(Some(accept)) if accept.split(',').any(|part| part.trim() == "text/event-stream"))
+            {
+                return bad("mcp_accept_required");
+            }
+            if ctx.body.as_ref().is_some_and(|b| !b.is_empty()) {
+                return bad("mcp_unexpected_body");
+            }
+            ctx.operation = Some(Operation {
+                protocol: "mcp",
+                action: format!("transport/{}", ctx.method.as_str().to_ascii_lowercase()),
+                target: None,
+            });
+            return Decision::Continue;
+        }
         let Some(body) = &ctx.body else {
             return bad("mcp_body_inspection_required");
         };
@@ -282,8 +315,17 @@ impl McpGuard {
             } else if version != Some(LEGACY_VERSION) {
                 return bad("mcp_unsupported_version");
             }
-            if id.is_none() && method != "notifications/initialized" {
+            if id.is_none()
+                && !matches!(
+                    method,
+                    "notifications/initialized" | "notifications/cancelled"
+                )
+            {
                 return bad("mcp_notification_not_supported");
+            }
+            if method == "notifications/cancelled" && !params.get("requestId").is_some_and(valid_id)
+            {
+                return bad("mcp_invalid_cancellation");
             }
             if id.is_some() && method.starts_with("notifications/") {
                 return bad("mcp_invalid_notification");
@@ -368,6 +410,9 @@ impl Block<RequestContext> for ToolPermissions {
                 "server/discover"
                 | "initialize"
                 | "notifications/initialized"
+                | "notifications/cancelled"
+                | "transport/get"
+                | "transport/delete"
                 | "ping"
                 | "tools/list" => Decision::Continue,
                 "tools/call" => match op.target.as_ref().and_then(|name| self.required.get(name)) {
@@ -418,6 +463,44 @@ mod tests {
     }
     fn inspect(c: &mut RequestContext) -> Decision {
         McpGuard::new("mcp".into(), 32768).unwrap().inspect(c)
+    }
+    #[test]
+    fn session_methods_require_opt_in_and_valid_protocol_metadata() {
+        let mut c = context(envelope("add"));
+        c.method = http::Method::GET;
+        c.body = Some(bytes::Bytes::new());
+        assert_eq!(
+            inspect(&mut c),
+            Decision::deny(Reason::MethodNotAllowed, "mcp_method_not_supported")
+        );
+        c.headers
+            .insert("mcp-protocol-version", LEGACY_VERSION.parse().unwrap());
+        c.headers
+            .insert("mcp-session-id", "owned-session".parse().unwrap());
+        let guard = McpGuard::new("mcp".into(), 32768)
+            .unwrap()
+            .allow_legacy(true)
+            .allow_sessions(true);
+        assert_eq!(guard.inspect(&mut c), Decision::Continue);
+        assert_eq!(c.operation.as_ref().unwrap().action, "transport/get");
+        c.headers
+            .append("mcp-session-id", "another-session".parse().unwrap());
+        assert_eq!(guard.inspect(&mut c), bad("mcp_session_required"));
+        assert!(c.operation.is_none());
+    }
+    #[test]
+    fn cancellation_cannot_omit_its_request_id() {
+        let mut c = context(
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}),
+        );
+        c.headers
+            .insert("mcp-protocol-version", LEGACY_VERSION.parse().unwrap());
+        let guard = McpGuard::new("mcp".into(), 32768)
+            .unwrap()
+            .allow_legacy(true);
+        assert_eq!(guard.inspect(&mut c), bad("mcp_invalid_cancellation"));
+        c.body = Some(bytes::Bytes::from(serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":12}})).unwrap()));
+        assert_eq!(guard.inspect(&mut c), Decision::Continue);
     }
     #[test]
     fn duplicate_keys_are_rejected_at_every_depth() {

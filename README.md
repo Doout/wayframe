@@ -41,38 +41,30 @@ deferred blocks opt into async work. Plans validate block identifiers and phase 
 decision stops evaluation. See the [typed-message example](crates/wayframe/examples/typed_message.rs)
 and [block authoring guide](docs/blocks.md).
 
-## MCP demonstration
+## MCP gateway
 
-The example gateway fronts a read-only Python MCP server with authentication, request limits,
-envelope validation, and tool permissions. It needs no model API key or paid service.
+The configurable gateway fronts an MCP server with authentication, tool permissions, limits,
+session ownership, and optional Wasm policy. It supports TCP HTTP, HTTP over Unix sockets, a
+stdio frontend, and verified HTTPS upstreams.
+
+The [notes example](examples/notes-server/README.md) uses the official MCP SDK and performs real
+SQLite writes, reads, and deletes. The integration tests verify persisted results, streaming,
+session isolation, denied writes, and the supported transports.
+
+See [gateway setup](examples/mcp-gateway/README.md) to run it against the notes service or your
+own MCP tools server. Configure full upstream URLs, client identities, tool grants, and limits in
+TOML; credentials come from named environment variables.
+
+The smaller read-only fixture is also available:
 
 ```bash
 bash scripts/demo.sh
 bash scripts/demo.sh --wasm
 ```
 
-Both commands build the Rust gateway, start it and the Python upstream on local ephemeral ports,
-exercise modern and legacy MCP requests, and stop both processes. The harness checks independent
-client/upstream credentials, tool access, mirrored headers, SSE responses, and rate limiting.
-The Wasm mode also checks the sample policy's denial of `admin_preview`.
-
-```text
-MCP client
-   │ client bearer token
-   ▼
-Rust gateway
-   Origin → Authentication → Request limit
-   → MCP validation → Tool permissions → Optional Wasm policy
-   │ separate upstream credential
-   ▼
-Read-only Python MCP server
-   add · search_docs · admin_preview
-```
-
-Readers can call `add` and `search_docs`; operators can also call the harmless `admin_preview`.
-With the plugin enabled, `admin_preview` is denied to everyone. A plugin's continue decision never
-bypasses another control. See the [gateway example](examples/mcp-gateway/README.md) for interactive
-setup and the [MCP profile](docs/mcp-profile.md) for protocol scope.
+Both commands build the Rust gateway, generate independent temporary credentials, exercise MCP
+requests, and stop the local processes. See the [MCP profile](docs/mcp-profile.md) for capability
+and transport boundaries.
 
 ## Workspace
 
@@ -104,7 +96,8 @@ bash scripts/verify.sh
 ```
 
 Verification checks Python and Rust formatting, the Python fixture, the native
-facade, all workspace features and targets, doctests, Clippy, and both live gateway modes.
+facade, all workspace features and targets, doctests, Clippy, both fixture gateway modes, and
+official SDK integration across the supported frontends.
 It uses the committed lockfile and writes local reports under `target/verification/`.
 GitHub Actions runs the same checks on Linux and macOS.
 
@@ -114,13 +107,18 @@ For fixture-only checks:
 python3 -m unittest discover -s examples/mcp-server/tests -v
 ```
 
-A native microbenchmark is included for local measurements:
+## Benchmarks
 
 ```bash
-cargo run --locked --release -p wayframe --example pipeline_cost
+bash scripts/benchmark.sh
 ```
 
-No latency or throughput target is claimed. See [performance notes](docs/performance.md).
+This measures paired direct-versus-gateway MCP calls across TCP, Unix, HTTPS, and stdio paths,
+with JSON/SSE responses, native/Wasm controls, varying payloads, and concurrency. It retains raw
+samples, p50/p95/p99, throughput, CPU, memory, and failures. Separate measurements cover native
+pipelines and task, Unix, HTTPS, and Wasm policy boundaries.
+
+See [performance methodology](docs/performance.md) before interpreting overhead differences.
 
 ## Scope
 
