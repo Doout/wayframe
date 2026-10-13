@@ -226,12 +226,14 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         config = services.config.read_text()
-        for name in ("a", "b"):
+        for name in ("a", "b", "c"):
             env = f"POLICY_{name.upper()}"
             services.env[env] = secrets.token_hex(32)
             config += f'\n[[async_policies]]\nid="policy-{name}"\nurl="https://127.0.0.1:{server.server_port}/{name}"\ntoken_env="{env}"\nca={json.dumps(str(services.certificate))}\ntimeout_ms=3000\n'
             if name == "b":
                 config += 'targets=["admin_preview","put_note"]\n'
+            if name == "c":
+                config += 'targets=["unused-target"]\n'
         services.config.write_text(config)
         services.env.update(
             OTEL_EXPORTER_OTLP_ENDPOINT=receiver.endpoint,
@@ -270,6 +272,18 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
         a, b = by_name["policy-a"], by_name["policy-b"]
         self.assertLess(max(a["start_ns"], b["start_ns"]), min(a["end_ns"], b["end_ns"]))
         self.assertIn("node.execution_ns", a["attributes"])
+        first_nodes = [s for s in nodes if s["trace_id"] == first_trace]
+        inactive = next(s for s in first_nodes if s["attributes"].get("node.id") == "policy-c")
+        self.assertEqual(inactive["attributes"]["node.outcome"], "skipped")
+        self.assertEqual(int(inactive["attributes"]["node.execution_ns"]), 0)
+        gate = next(s for s in first_nodes if s["attributes"].get("node.id") == "policy-2-gate")
+        self.assertEqual(gate["attributes"]["node.outcome"], "succeeded")
+        execution = next(
+            s
+            for s in receiver.spans()
+            if s["name"] == "workflow.execution" and s["trace_id"] == first_trace
+        )
+        self.assertEqual(int(execution["attributes"]["workflow.pruned_nodes"]), 3)
         selected = [
             s
             for s in receiver.spans()

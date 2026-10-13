@@ -2,7 +2,7 @@
 use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
     any::{Any, TypeId},
-    collections::HashSet,
+    collections::{BTreeSet, HashSet, VecDeque},
     fmt,
     future::Future,
     marker::PhantomData,
@@ -86,6 +86,13 @@ pub struct NodeReport {
     pub scheduler_wait: Duration,
     /// Time executing after scheduler admission.
     pub elapsed: Duration,
+    /// Why the node was removed from this invocation's executable graph.
+    pub skip_reason: Option<SkipReason>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    BranchNotSelected,
+    DependencySkipped,
 }
 pub struct Run {
     scope: Arc<()>,
@@ -154,9 +161,19 @@ struct Node {
     input_types: Vec<TypeId>,
     output: TypeId,
     action: Action,
-    condition: Option<(usize, bool)>,
+    condition: Option<Condition>,
     kind: Kind,
     budget: Option<Duration>,
+}
+struct Condition {
+    dependency: usize,
+    matches: Arc<dyn Fn(&Value) -> bool + Send + Sync>,
+}
+/// Immutable indexes prepared once per graph generation. No executable code is generated.
+struct Topology {
+    dependents: Vec<Vec<usize>>,
+    guarded: Vec<Vec<usize>>,
+    gates: Vec<usize>,
 }
 pub struct Builder<C> {
     scope: Arc<()>,
@@ -167,6 +184,7 @@ pub struct Builder<C> {
 pub struct Flow<C> {
     scope: Arc<()>,
     nodes: Arc<Vec<Node>>,
+    topology: Topology,
     limits: Limits,
     admission: Arc<Semaphore>,
     running: Arc<Semaphore>,
@@ -331,14 +349,33 @@ impl<C: Context + Sync> Builder<C> {
         a: &Port<T>,
         b: &Port<T>,
     ) -> Result<Port<T>, Error> {
-        let deps = vec![self.check(a)?, self.check(b)?];
+        self.choice_many(id, phase, &[a.clone(), b.clone()])
+    }
+    /// Join any number of alternatives. Exactly one must produce a value.
+    pub fn choice_many<T: Send + Sync + 'static>(
+        &mut self,
+        id: impl Into<String>,
+        phase: Phase,
+        alternatives: &[Port<T>],
+    ) -> Result<Port<T>, Error> {
+        if alternatives.len() < 2 || alternatives.len() > 256 {
+            return Err(Error::InvalidGraph("invalid_choice_width"));
+        }
+        let deps = alternatives
+            .iter()
+            .map(|port| self.check(port))
+            .collect::<Result<Vec<_>, _>>()?;
+        if deps.iter().copied().collect::<HashSet<_>>().len() != deps.len() {
+            return Err(Error::InvalidGraph("duplicate_choice_input"));
+        }
+        let count = deps.len();
         self.add(
             id,
             phase,
             deps,
-            vec![TypeId::of::<T>(); 2],
-            Arc::new(|args| {
-                let mut active = args.into_iter().take(2).flatten();
+            vec![TypeId::of::<T>(); count],
+            Arc::new(move |args| {
+                let mut active = args.into_iter().take(count).flatten();
                 let first = active.next();
                 Task::Immediate(match (first, active.next()) {
                     (Some(value), None) => Ok(value),
@@ -430,12 +467,32 @@ impl<C: Context + Sync> Builder<C> {
         condition: &Port<bool>,
         expected: bool,
     ) -> Result<(), Error> {
+        self.when_value(node, condition, expected)
+    }
+    /// Select a branch from a typed fact (for example an enum). The fact is read afresh each run.
+    /// Guard every optional producer; an unguarded dependency is still required work.
+    pub fn when_value<T, K>(
+        &mut self,
+        node: &Port<T>,
+        condition: &Port<K>,
+        expected: K,
+    ) -> Result<(), Error>
+    where
+        K: Eq + Send + Sync + 'static,
+    {
         let n = self.check(node)?;
         let d = self.check(condition)?;
         if n == 0 || self.nodes[n].kind == Kind::Gate || self.nodes[n].condition.is_some() {
             return Err(Error::InvalidGraph("conditional_gate_or_duplicate"));
         }
-        self.nodes[n].condition = Some((d, expected));
+        self.nodes[n].condition = Some(Condition {
+            dependency: d,
+            matches: Arc::new(move |value| {
+                value
+                    .downcast_ref::<K>()
+                    .is_some_and(|value| *value == expected)
+            }),
+        });
         if !self.nodes[n].deps.contains(&d) {
             self.nodes[n].deps.push(d);
         }
@@ -513,9 +570,26 @@ impl<C: Context + Sync> Builder<C> {
                 return Err(Error::InvalidGraph("dispatch_bypasses_mandatory_gate"));
             }
         }
+        let mut topology = Topology {
+            dependents: vec![vec![]; self.nodes.len()],
+            guarded: vec![vec![]; self.nodes.len()],
+            gates: vec![],
+        };
+        for (i, node) in self.nodes.iter().enumerate() {
+            for dependency in &node.deps {
+                topology.dependents[*dependency].push(i);
+            }
+            if let Some(condition) = &node.condition {
+                topology.guarded[condition.dependency].push(i);
+            }
+            if node.kind == Kind::Gate {
+                topology.gates.push(i);
+            }
+        }
         Ok(Flow {
             scope: self.scope,
             nodes: Arc::new(self.nodes),
+            topology,
             limits: self.limits,
             admission: Arc::new(Semaphore::new(self.limits.max_executions)),
             running: Arc::new(Semaphore::new(self.limits.max_running_nodes)),
@@ -531,6 +605,106 @@ impl<C: Context + Sync> Default for Builder<C> {
 struct NodeTimer {
     span: tracing::Span,
     done: bool,
+}
+/// Per-invocation partial evaluation. Resolved facts remove inactive paths before scheduling them.
+struct Schedule {
+    remaining: Vec<usize>,
+    ready: BTreeSet<usize>,
+    ready_at: Vec<Option<Instant>>,
+    settled: VecDeque<usize>,
+    pending: usize,
+    branch_checks: usize,
+    pruned: usize,
+}
+impl Schedule {
+    fn new(nodes: &[Node]) -> Self {
+        Self {
+            remaining: nodes.iter().map(|node| node.deps.len()).collect(),
+            ready: BTreeSet::new(),
+            ready_at: vec![None; nodes.len()],
+            settled: VecDeque::with_capacity(nodes.len()),
+            pending: nodes.len() - 1,
+            branch_checks: 0,
+            pruned: 0,
+        }
+    }
+    fn skip(&mut self, i: usize, reason: SkipReason, reports: &mut [NodeReport], start: Instant) {
+        self.ready.remove(&i);
+        self.ready_at[i] = None;
+        self.pending -= 1;
+        self.pruned += 1;
+        reports[i].state = State::Skipped;
+        reports[i].dependency_wait = start.elapsed();
+        reports[i].skip_reason = Some(reason);
+        // Pruning is observable but never takes a node execution permit or invokes its action.
+        let span = tracing::info_span!("workflow.node", node.id = %reports[i].id,
+            node.outcome = "skipped", node.skip_reason = ?reason,
+            node.dependency_wait_ns = reports[i].dependency_wait.as_nanos().min(u64::MAX as u128) as u64,
+            node.scheduler_wait_ns = 0u64, node.execution_ns = 0u64);
+        drop(span);
+    }
+    fn complete(
+        &mut self,
+        completed: usize,
+        nodes: &[Node],
+        topology: &Topology,
+        values: &[Option<Value>],
+        reports: &mut [NodeReport],
+        start: Instant,
+    ) -> Result<(), Error> {
+        self.settled.push_back(completed);
+        while let Some(dependency) = self.settled.pop_front() {
+            // Resolve guards first, even when their other dependencies are still running.
+            for &i in &topology.guarded[dependency] {
+                if reports[i].state != State::Pending {
+                    continue;
+                }
+                let condition = nodes[i].condition.as_ref().expect("compiled guard");
+                let span = tracing::info_span!("workflow.branch", node.id = %nodes[i].id,
+                    branch.selector = %nodes[dependency].id, branch.selected = tracing::field::Empty);
+                self.branch_checks += 1;
+                let selected = span
+                    .in_scope(|| {
+                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            values[dependency]
+                                .as_ref()
+                                .is_some_and(|value| (condition.matches)(value))
+                        }))
+                    })
+                    .map_err(|_| Error::Panic)?;
+                span.record("branch.selected", selected);
+                drop(span);
+                if !selected {
+                    self.skip(i, SkipReason::BranchNotSelected, reports, start);
+                    self.settled.push_back(i);
+                }
+            }
+            for &i in &topology.dependents[dependency] {
+                if reports[i].state != State::Pending {
+                    continue;
+                }
+                if reports[dependency].state == State::Skipped && nodes[i].kind != Kind::Choice {
+                    self.skip(i, SkipReason::DependencySkipped, reports, start);
+                    // A graph may be embedded before dispatch in another pipeline. Its mandatory
+                    // gates must fail closed here, even when it has no internal dispatch node.
+                    if nodes[i].kind == Kind::Gate {
+                        return Err(Error::Denied(
+                            Reason::Forbidden,
+                            "mandatory_gate_not_satisfied",
+                        ));
+                    }
+                    self.settled.push_back(i);
+                } else {
+                    self.remaining[i] -= 1;
+                    if self.remaining[i] == 0 {
+                        self.ready.insert(i);
+                        self.ready_at[i] = Some(Instant::now());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 impl Drop for NodeTimer {
     fn drop(&mut self) {
@@ -587,6 +761,7 @@ impl<C: Context + Sync> Flow<C> {
                 dependency_wait: Duration::ZERO,
                 scheduler_wait: Duration::ZERO,
                 elapsed: Duration::ZERO,
+                skip_reason: None,
             })
             .collect();
         let _admission = match self.admission.clone().try_acquire_owned() {
@@ -601,12 +776,13 @@ impl<C: Context + Sync> Flow<C> {
         let mut values = vec![None; self.nodes.len()];
         values[0] = Some(context as Value);
         reports[0].state = State::Succeeded;
-        let mut pending = self.nodes.len() - 1;
         let mut tasks: FuturesUnordered<Running> = FuturesUnordered::new();
-        let mut ready_at: Vec<Option<Instant>> = vec![None; self.nodes.len()];
+        let mut schedule = Schedule::new(&self.nodes);
         let span = tracing::info_span!(
             "workflow.execution",
             workflow.nodes = self.nodes.len() - 1,
+            workflow.branch_checks = tracing::field::Empty,
+            workflow.pruned_nodes = tracing::field::Empty,
             workflow.outcome = tracing::field::Empty
         );
         struct ExecutionGuard(Option<tracing::Span>);
@@ -619,48 +795,25 @@ impl<C: Context + Sync> Flow<C> {
         }
         let mut guard = ExecutionGuard(Some(span.clone()));
         let execution = async {
+            schedule.complete(0, &self.nodes, &self.topology, &values, &mut reports, start)?;
             loop {
                 if Instant::now() >= deadline {
                     return Err(Error::Deadline);
                 }
-                let mut changed = false;
-                for i in 1..self.nodes.len() {
+                while tasks.len() < self.limits.max_parallel {
+                    let Some(i) = schedule.ready.pop_first() else {
+                        break;
+                    };
                     let node = &self.nodes[i];
-                    if reports[i].state != State::Pending
-                        || node
-                            .deps
-                            .iter()
-                            .any(|d| matches!(reports[*d].state, State::Pending | State::Running))
-                    {
-                        continue;
-                    }
-                    let ready = *ready_at[i].get_or_insert_with(Instant::now);
+                    let ready = schedule.ready_at[i].expect("ready node");
                     reports[i].dependency_wait = ready.duration_since(start);
-                    let skipped = node
-                        .deps
-                        .iter()
-                        .any(|d| reports[*d].state == State::Skipped)
-                        && node.kind != Kind::Choice;
-                    let condition = node.condition.is_none_or(|(d, expected)| {
-                        values[d]
-                            .as_ref()
-                            .and_then(|v| v.downcast_ref::<bool>())
-                            .is_some_and(|v| *v == expected)
-                    });
-                    if skipped || !condition {
-                        reports[i].state = State::Skipped;
-                        pending -= 1;
-                        changed = true;
-                        continue;
-                    }
-                    if tasks.len() >= self.limits.max_parallel {
-                        continue;
-                    }
                     // Choices cannot bypass a mandatory gate through a skipped branch.
                     if node.kind == Kind::Dispatch
-                        && self.nodes.iter().enumerate().any(|(g, n)| {
-                            n.kind == Kind::Gate && reports[g].state != State::Succeeded
-                        })
+                        && self
+                            .topology
+                            .gates
+                            .iter()
+                            .any(|g| reports[*g].state != State::Succeeded)
                     {
                         return Err(Error::Denied(
                             Reason::Forbidden,
@@ -668,8 +821,7 @@ impl<C: Context + Sync> Flow<C> {
                         ));
                     }
                     reports[i].state = State::Running;
-                    pending -= 1;
-                    changed = true;
+                    schedule.pending -= 1;
                     let args = node.deps.iter().map(|d| values[*d].clone()).collect();
                     let action = node.action.clone();
                     let semaphore = self.running.clone();
@@ -737,19 +889,17 @@ impl<C: Context + Sync> Flow<C> {
                         .instrument(instrumentation),
                     ));
                 }
-                if pending == 0 && tasks.is_empty() {
+                if schedule.pending == 0 && tasks.is_empty() {
                     return Ok(());
                 }
-                if tasks.is_empty() && !changed {
+                if tasks.is_empty() {
                     return Err(Error::InvalidGraph("unreachable_nodes"));
                 }
                 // A ready node's budget must expire even while a sibling occupies the last slot.
-                let waiting_deadline = self
-                    .nodes
+                let waiting_deadline = schedule
+                    .ready
                     .iter()
-                    .enumerate()
-                    .filter(|(i, _)| reports[*i].state == State::Pending)
-                    .filter_map(|(i, n)| Some(ready_at[i]? + n.budget?))
+                    .filter_map(|i| Some(schedule.ready_at[*i]? + self.nodes[*i].budget?))
                     .min()
                     .unwrap_or(deadline)
                     .min(deadline);
@@ -761,6 +911,14 @@ impl<C: Context + Sync> Flow<C> {
                             Ok(value) => {
                                 values[i] = Some(value);
                                 reports[i].state = State::Succeeded;
+                                schedule.complete(
+                                    i,
+                                    &self.nodes,
+                                    &self.topology,
+                                    &values,
+                                    &mut reports,
+                                    start,
+                                )?;
                             }
                             Err(error) => {
                                 reports[i].state = State::Failed;
@@ -772,13 +930,14 @@ impl<C: Context + Sync> Flow<C> {
                     Err(_) => {
                         for (i, node) in self.nodes.iter().enumerate() {
                             if reports[i].state == State::Pending
-                                && ready_at[i].is_some_and(|ready| {
+                                && schedule.ready_at[i].is_some_and(|ready| {
                                     node.budget
                                         .is_some_and(|budget| ready + budget <= Instant::now())
                                 })
                             {
                                 reports[i].state = State::Failed;
-                                reports[i].scheduler_wait = ready_at[i].expect("ready").elapsed();
+                                reports[i].scheduler_wait =
+                                    schedule.ready_at[i].expect("ready").elapsed();
                                 tracing::warn!(node.id = %node.id, node.outcome = "timed_out",
                                     node.scheduler_wait_ns = reports[i].scheduler_wait.as_nanos().min(u64::MAX as u128) as u64,
                                     "workflow scheduler budget expired");
@@ -793,6 +952,8 @@ impl<C: Context + Sync> Flow<C> {
         // Dropping sibling futures closes scopes and releases cooperative resources; no detached tasks.
         drop(tasks);
         guard.0 = None;
+        span.record("workflow.branch_checks", schedule.branch_checks as u64);
+        span.record("workflow.pruned_nodes", schedule.pruned as u64);
         match result {
             Ok(()) => {
                 span.record("workflow.outcome", "succeeded");

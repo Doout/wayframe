@@ -5,6 +5,50 @@ Each node reads immutable typed inputs and returns its own output. It never race
 request contexts. `join` names the merge; `choice` requires exactly one active input. `when` adds
 conditional execution, and skipped dependencies propagate until an explicit choice.
 
+`when_value` selects branches from any immutable `Eq + Send + Sync` fact, including an enum.
+`choice_many` rejoins several alternatives and requires exactly one output. A selector can depend
+on earlier async work, so later facts can resolve nested branches during the same invocation.
+
+```rust,ignore
+#[derive(PartialEq, Eq)]
+enum Route { Read, Write, Admin }
+let route = builder.sync("route", Phase::Inspect, &input, |ctx| Ok(classify(ctx)))?;
+let read = builder.asynchronous("read", Phase::Inspect, &input, read_request)?;
+let write = builder.asynchronous("write", Phase::Inspect, &input, write_request)?;
+let admin = builder.asynchronous("admin", Phase::Inspect, &input, admin_request)?;
+builder.when_value(&read, &route, Route::Read)?;
+builder.when_value(&write, &route, Route::Write)?;
+builder.when_value(&admin, &route, Route::Admin)?;
+let selected = builder.choice_many("selected", Phase::Inspect, &[read, write, admin])?;
+let after = builder.sync("after", Phase::Authorize, &selected, sync_followup)?;
+```
+
+## Specializing a graph as facts arrive
+
+Compilation prepares dependency and selector indexes once per graph generation. Execution visits
+ready nodes through those indexes. As soon as a selector resolves, its inactive branches and their
+ordinary descendants are removed from the executable set, even if other dependencies are still
+running. Pruned actions never run, allocate an action future or take a node execution permit.
+Choices wait for their alternatives to settle, validate exactly one value, and resume synchronous
+or async work afterward. Independent selected work still runs up to the configured parallel limit.
+
+This is partial evaluation of a prepared graph: current facts simplify the remaining work. It
+does not generate machine code. Each invocation owns its facts, values and ready set; the compiled
+topology can be reused concurrently. Request identities, policy outcomes and branch decisions are
+evaluated afresh. Configuration reloads prepare a new topology before publication.
+
+Guard the first optional producer on each path. An unguarded producer remains required work, even
+when one of its consumers is pruned, since it might have side effects or other consumers. A nested
+choice also needs its parent guard when the whole nested path is optional. Skipping every nested
+alternative without that guard is an empty choice and fails. Selector functions and equality
+comparisons are trusted native code and must be short; panics fail the invocation.
+
+`NodeReport::skip_reason` distinguishes `BranchNotSelected` from `DependencySkipped`, with zero
+scheduler and execution time for pruned nodes. OTLP exports `workflow.branch` selector decisions,
+`workflow.node` skip reasons, and `workflow.execution` counts for `workflow.branch_checks` and
+`workflow.pruned_nodes`. These measurements describe work saved; spans and reporting still have a
+cost. Use the release benchmark to assess that cost for your graph and tracing configuration.
+
 ```rust,ignore
 use wayframe::{flow::Builder, prelude::*};
 let mut builder = Builder::<MyContext>::new();
@@ -29,7 +73,8 @@ let value = run.get(&after);
 Use `gate`/`gate_async` for mandatory policy decisions and `dispatch` for protected work. Compilation
 rejects cycles, foreign ports, reversed phases, oversized graphs, and dispatch nodes without every
 mandatory gate as a dependency. Gates cannot be conditional. Runtime validation also rejects a
-skipped gate at a conditional join. A denial or failed node cancels siblings and prevents dispatch.
+skipped gate, including in an embedded graph that dispatches afterward through its parent pipeline.
+A denial or failed node cancels siblings and prevents dispatch.
 A quorum helper is available for ordinary independent work; it cannot replace mandatory gates.
 
 The default limits bound executions, concurrent nodes per execution, and concurrent nodes across
@@ -66,8 +111,9 @@ The reference gateway selects per inspected MCP operation. An external policy's 
 `operations` and `targets` are exact selectors; empty lists apply to every operation/target.
 `async_parallel_threshold` defaults to 2. Below the threshold, applicable policies execute linearly;
 at or above it, the same policy checks execute through the prepared graph. No graph compilation or
-speculative policy call happens on the request path. Inactive graph gates return Continue, while
-every applicable gate is mandatory.
+speculative policy call happens on the request path. The graph resolves each policy's applicability,
+prunes its inactive call branch, and joins the selected result into an unconditional mandatory gate.
+An inapplicable policy joins Continue; every applicable policy result must pass its gate.
 
 ```toml
 async_parallel_threshold = 2
@@ -94,3 +140,6 @@ dependency/admission/execution timings. `/metrics` reports selection counts per 
 Use measured workload costs to choose thresholds or an application selector. Tiny native operations
 often cost more to schedule than to run sequentially. Live barrier tests prove both runtime choices,
 parallel overlap and terminal denials; microbenchmarks measure selection overhead separately.
+`flow_cost` also reports `branch_cases` for selected and pruned optional chains of 1, 16, 64 and 128
+nodes, with seven timing batches and the executed/pruned counts. These are warm native no-op graphs
+with tracing disabled, rather than network latency or production capacity estimates.

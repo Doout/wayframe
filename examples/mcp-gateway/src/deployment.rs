@@ -39,13 +39,6 @@ impl MatchedPolicy {
                         .is_some_and(|t| self.targets.contains(t)))
         })
     }
-    async fn decide(&self, ctx: &RequestContext) -> Decision {
-        if self.applies(ctx) {
-            self.external.decide(ctx).await
-        } else {
-            Decision::Continue
-        }
-    }
 }
 impl Block<RequestContext> for MatchedPolicy {
     fn id(&self) -> &str {
@@ -228,7 +221,7 @@ pub(crate) async fn prepare_deployment(
         let root = graph.input();
         let mut gates = Vec::new();
         let mut checks = Vec::new();
-        for control in &config.async_policies {
+        for (index, control) in config.async_policies.iter().enumerate() {
             let token = config::secret(&control.token_env)?;
             let ca = control
                 .ca
@@ -258,14 +251,38 @@ pub(crate) async fn prepare_deployment(
                 targets: control.targets.clone(),
             });
             checks.push(matched.clone());
-            gates.push(graph.gate_async(
-                control.id.clone(),
+            let selection = matched.clone();
+            let applies = graph.sync(
+                format!("policy-{index}-match"),
                 Phase::Authorize,
                 &root,
-                move |ctx| {
+                move |ctx| Ok(selection.applies(&ctx)),
+            )?;
+            let call =
+                graph.asynchronous(control.id.clone(), Phase::Authorize, &root, move |ctx| {
                     let matched = matched.clone();
-                    async move { matched.decide(&ctx).await }
-                },
+                    async move { Ok(matched.external.decide(&ctx).await) }
+                })?;
+            graph.when(&call, &applies, true)?;
+            let inactive = graph.sync(
+                format!("policy-{index}-inactive"),
+                Phase::Authorize,
+                &root,
+                |_| Ok(Decision::Continue),
+            )?;
+            graph.when(&inactive, &applies, false)?;
+            let result = graph.choice(
+                format!("policy-{index}-result"),
+                Phase::Authorize,
+                &call,
+                &inactive,
+            )?;
+            // Applicability can remove optional work, but the policy gate must still succeed.
+            gates.push(graph.gate(
+                format!("policy-{index}-gate"),
+                Phase::Authorize,
+                &result,
+                |decision| decision.clone(),
             )?);
         }
         let joined = graph.sync("policy-join", Phase::Authorize, &root, |_| Ok(()))?;
