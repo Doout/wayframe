@@ -2878,7 +2878,6 @@ dependencies = [
  "http",
  "jsonwebtoken",
  "serde",
- "serde_json",
  "sha2",
  "subtle",
  "tokio",
@@ -2916,7 +2915,6 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
- "tower",
  "wayframe-core",
  "wayframe-runtime",
 ]

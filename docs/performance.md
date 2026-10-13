@@ -1,47 +1,29 @@
-# Performance model and measurement plan
+# Performance
 
-There are **no measured Wayframe latency, throughput or Wasm prewarm claims** in this source alpha.
-Choosing Rust or moving preparation off the request path is not a benchmark result.
+No latency or throughput target has been established. Native blocks use direct virtual calls
+on one mutable context; immediate decisions avoid boxed futures. HTTP bodies stream unless
+bounded inspection is requested. Task, network, JSON, and Wasm boundaries add their own costs.
 
-## Designed fast path
-
-Native blocks communicate by direct virtual calls on one mutable typed context. Immediate decisions
-avoid a per-block boxed future. Graph validation happens during plan construction. Channels, RPC,
-Wasm imports and JSON parsing are optional boundaries. HTTP bodies stream unless inspection is
-explicitly requested; MCP inspection intentionally buffers a small bounded JSON envelope.
-
-The initial native limiter is a mutex-protected token bucket map. It is bounded, but it can contend
-at scale. Profile before replacing it with shards/per-worker counters and document the resulting
-quota semantics. This source does not promise zero allocations, zero copies, lock-free requests,
-exact global quotas or peak packet-processing performance.
-
-## Included microbenchmark
+## Native microbenchmark
 
 ```bash
-mkdir -p verification/local
-cargo run --release -p wayframe --example pipeline_cost > verification/local/pipeline-cost.json
+cargo run --locked --release -p wayframe --example pipeline_cost
 ```
 
-The harness evaluates 0, 1, 4, 16 and 64 native blocks with reused work items. It reports mean
-nanoseconds per evaluation and a checksum. This isolates one small overhead dimension; it does
-not report p99, HTTP overhead, guest overhead, network latency, or a statistical confidence interval.
-Repeat runs on the same otherwise idle pinned CPU cohort and retain compiler/configuration/raw data.
-Compare the increase relative to the empty pipeline, not just absolute totals across machines.
+This evaluates 0, 1, 4, 16, and 64 native blocks with reused work items, reporting mean nanoseconds
+per evaluation and a checksum. It measures pipeline overhead, excluding HTTP, network, and guest
+execution. Repeat runs under equivalent conditions and retain the compiler, configuration, and
+raw results. Compare each pipeline with the empty baseline.
 
-## Full benchmark matrix before release
+## Gateway measurements
 
-Measure no-op direct baseline, native controls, bounded task hops, Unix/HTTPS policy calls and
-Wasm policy calls. Measure cold compile, pre-link, clean instantiate, warm invocation and refill
-separately. Include saturation, pool depletion, denied requests, traps and overlapping generations.
-Record p50/p95/p99, throughput, CPU/request, bytes/sec, allocations, process RSS, active connections,
-queue lengths and admission rejections. Make TLS/auth/body/protocol settings identical for any
-comparison to another proxy; Python fixture performance is not a proxy benchmark baseline.
+Compare native controls, task hops, Unix/HTTPS policy calls, and Wasm calls under equivalent
+TLS/auth/body/protocol settings. Measure compile, pre-link, clean instantiation, warm invocation,
+and refill separately. Include saturation, pool depletion, denied requests, traps, and overlapping
+generations. Record latency percentiles, throughput, CPU, allocations, RSS, queue lengths, and
+admission rejections.
 
-A clean single-use pool must replenish at least as quickly as steady admitted invocations consume
-slots. A rough sizing estimate is `warm headroom >= burst + peak arrival rate * refill delay`,
-subject to explicit memory and CPU ceilings. Queueing, variance and competing initializations make
-this a starting estimate, not an SLO proof. Full reserve, large pools or same-tenant Store reuse are
-not substitutes for measurements and isolation tests.
-
-No kernel bypass, io_uring, shared-memory transport or eBPF path is implemented. Add a specialized
-adapter only after equivalent-workload measurement shows a benefit worth its maintenance burden.
+The local token bucket uses a bounded mutex-protected map; profile contention before changing its
+quota semantics. A single-use Wasm pool must replenish fast enough to sustain admitted calls.
+A starting estimate is `warm headroom >= burst + peak arrival rate * refill delay`, subject to
+memory and CPU budgets. Validate it under load before choosing operational limits.

@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
 [lints]
 workspace = true
+
 [dependencies]
 wayframe = { path = "../../crates/wayframe", features = ["http", "controls", "mcp"] }
 anyhow.workspace = true
@@ -15,6 +17,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
+
 [features]
 default = []
 wasm = ["wayframe/wasm"]

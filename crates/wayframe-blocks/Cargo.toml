@@ -11,12 +11,12 @@ workspace = true
 
 [dependencies]
 wayframe-core = { path = "../wayframe-core" }
+wayframe-http = { path = "../wayframe-http" }
 http.workspace = true
-tokio.workspace = true
 jsonwebtoken.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 
-wayframe-http = { path = "../wayframe-http" }
+[dev-dependencies]
+tokio.workspace = true

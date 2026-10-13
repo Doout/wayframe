@@ -68,8 +68,15 @@ credentials. It is not ready to be configured as a public remote MCP endpoint in
 client. Public deployments need production ingress, an appropriate identity provider, protected
 resource discovery/authorization, credential audience checks and host resource hardening.
 
-## Normative references
+## References
 
-See [references.md](references.md) for the official transport, versioning, discovery, metadata,
-tools and authorization pages used when writing this profile. Local fixture tests are not an
-independent conformance certification, and interoperability with third-party MCP SDKs remains unverified.
+- [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
+- [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http)
+- [Discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)
+- [Versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
+- [Metadata](https://modelcontextprotocol.io/specification/2026-07-28/basic/metadata)
+- [Tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
+- [Authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
+- [2025-11-25 transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+
+Fixture tests cover the supported profile. Independent SDK interoperability remains unverified.

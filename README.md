@@ -7,8 +7,7 @@ protocol, policy blocks, listeners, and deployment model. A dependency-free core
 blocks and linear plans; optional crates add HTTP forwarding, authentication, MCP inspection,
 transport bridges, and sandboxed Wasm policies.
 
-This is an early alpha. See [build status](BUILD_STATUS.md) for validation evidence and
-[security boundaries](SECURITY.md) before deploying it.
+This is an early alpha. See [security boundaries](SECURITY.md) before deploying it.
 
 ```text
 Your application
@@ -104,15 +103,14 @@ python3 -m pip install -r requirements-dev.txt
 bash scripts/verify.sh
 ```
 
-Verification checks Python and Rust formatting, source structure, the Python fixture, the native
+Verification checks Python and Rust formatting, the Python fixture, the native
 facade, all workspace features and targets, doctests, Clippy, and both live gateway modes.
-It uses the committed lockfile and writes local reports under ignored `verification/local/`.
+It uses the committed lockfile and writes local reports under `target/verification/`.
 GitHub Actions runs the same checks on Linux and macOS.
 
 For fixture-only checks:
 
 ```bash
-python3 scripts/check_source.py
 python3 -m unittest discover -s examples/mcp-server/tests -v
 ```
 
@@ -132,6 +130,6 @@ signatures and registries, external-worker supervision, distributed graphs, and 
 conformance are future work. Static demo tokens are for loopback development.
 
 Further reading: [Architecture](docs/architecture.md), [Plugins](docs/plugins.md),
-[Roadmap](docs/roadmap.md), [Contributing](CONTRIBUTING.md), and [References](docs/references.md).
+[Roadmap](docs/roadmap.md) and [Contributing](CONTRIBUTING.md).
 
 Licensed under [Apache-2.0](LICENSE).

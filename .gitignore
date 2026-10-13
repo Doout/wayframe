@@ -9,5 +9,3 @@
 *.log
 __pycache__/
 *.pyc
-/verification/local/
-/benchmarks/results/

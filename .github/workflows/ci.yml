@@ -33,4 +33,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: verification-${{ matrix.os }}
-          path: verification/local/
+          path: target/verification/

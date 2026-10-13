@@ -4,7 +4,7 @@ This application demonstrates the framework. It is **not** the framework's manda
 It fronts the read-only Python MCP fixture with authentication, request limiting, protocol inspection,
 tool permission checks and an optional prewarmed Wasm policy.
 
-See [build status](../../BUILD_STATUS.md) for the tested environment and
+See [verification instructions](../../CONTRIBUTING.md#verification) for development checks and
 [security boundaries](../../SECURITY.md) for deployment limitations.
 
 ## Automated demonstration

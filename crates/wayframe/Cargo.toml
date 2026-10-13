@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
 [lints]
 workspace = true
+
 [dependencies]
 wayframe-core = { path = "../wayframe-core" }
 wayframe-runtime = { path = "../wayframe-runtime" }
@@ -15,6 +17,7 @@ wayframe-blocks = { path = "../wayframe-blocks", optional = true }
 wayframe-transport = { path = "../wayframe-transport", optional = true }
 wayframe-mcp = { path = "../wayframe-mcp", optional = true }
 wayframe-wasm = { path = "../wayframe-wasm", optional = true }
+
 [features]
 default = []
 http = ["dep:wayframe-http"]
@@ -22,5 +25,6 @@ controls = ["http", "dep:wayframe-blocks"]
 transport = ["http", "dep:wayframe-transport"]
 mcp = ["http", "dep:wayframe-mcp"]
 wasm = ["http", "dep:wayframe-wasm"]
+
 [dev-dependencies]
 tokio.workspace = true

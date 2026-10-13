@@ -21,6 +21,3 @@ reqwest.workspace = true
 async-stream.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-tower.workspace = true

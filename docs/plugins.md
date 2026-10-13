@@ -37,7 +37,6 @@ real CPU and memory even though it is scheduled outside the request path. An emp
 A used Store is **never returned to the clean pool**. Fresh stores are built from shared compiled
 code and a prelinked component. This avoids trusting guest `reset()` routines with request/tenant
 data. Persistent guest caches/state and arbitrary continuation checkpoints are intentionally absent.
-Shared state should be an explicitly scoped host service in a future reviewed interface.
 
 Pool dimensions are bounded by the manifest: 1..64 warm instances; 1..64 MiB memory per guest;
 1..10,000,000 fuel; 1..1000 ms call deadlines; 1..5000 ms initialization deadlines. The v0.1 runtime
@@ -71,7 +70,7 @@ allocator is intentionally valid only for a single-use instance with the host's 
 projected-metadata bound. Do not reuse that guest as a long-lived application worker.
 
 The equivalent Rust guest source is also included. After installing a compatible `wasm-tools`
-CLI, the illustrative guest build steps are:
+CLI, build the guest with:
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -81,16 +80,10 @@ wasm-tools component new \
   -o plugins/path-control/path-control.component.wasm
 ```
 
-The Rust guest/compiler toolchain and component conversion have not been run here. To activate
-the built component, change the manifest's `component` field and recompute SHA-256 over those
-exact bytes, then review and reinstall the manifest. Never edit the checked-in digest without
-changing the admitted artifact intentionally.
+The verification suite uses the bundled WAT; it does not build or convert the Rust guest.
+To activate a built component, change the manifest's `component` field, recompute SHA-256 over
+those exact bytes, and review the manifest before loading it.
 
-## Future runtime adapters
-
-A standard WASI HTTP application, a command worker, and a metadata-only gateway control have
-different worlds, lifecycle and trust needs. They should be separate optional adapters behind
-stable boundaries, not silently interchangeable policy components. This package intentionally
-has no external runtime branding or mandatory Git dependency. Disk native-AOT deserialization,
-persistent resident-worker reuse and third-party host capabilities require new reviewed APIs and
-benchmarks rather than unverified reuse promises.
+Runtime references: [typed functions](https://docs.rs/wasmtime/49.0.2/wasmtime/component/struct.TypedFunc.html),
+[store limits](https://docs.rs/wasmtime/49.0.2/wasmtime/struct.Store.html), and
+[pre-instantiation](https://docs.rs/wasmtime/49.0.2/wasmtime/component/struct.InstancePre.html).

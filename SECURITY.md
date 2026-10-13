@@ -1,4 +1,4 @@
-# Security boundary — source alpha
+# Security
 
 **Do not deploy this package as an internet-facing or hostile-tenant gateway before completing
 build verification and an independent security review. No security certification is claimed.**
@@ -17,7 +17,7 @@ path normalization; per-request and stream limits; bounded local token-bucket ca
 external frames with correlation and peer validation; narrow Wasm metadata grants; no WASI or
 arbitrary host imports; guest fuel/memory/deadline budgets; fresh single-use guest instances.
 
-See [build status](BUILD_STATUS.md) for executed checks and remaining release gates.
+See [verification instructions](CONTRIBUTING.md#verification) for development checks.
 
 ## Deliberate limitations
 
