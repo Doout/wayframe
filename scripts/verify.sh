@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 command -v cargo >/dev/null || { echo 'Rust/Cargo required; see README.md' >&2; exit 2; }
-python3 -c 'import jsonschema, ruff, mcp, httpx, httpx2, psutil' || { echo 'Install requirements-dev.txt before running verification.' >&2; exit 2; }
+python3 -c 'import jsonschema, ruff, mcp, httpx, httpx2, psutil, opentelemetry.proto' || { echo 'Install requirements-dev.txt before running verification.' >&2; exit 2; }
 
 report_dir=target/verification
 mkdir -p "$report_dir"

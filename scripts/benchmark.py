@@ -10,6 +10,7 @@ import hashlib
 import importlib.metadata
 import json
 import platform
+import secrets
 import ssl
 import statistics
 import subprocess
@@ -22,6 +23,7 @@ import httpx
 import psutil
 from mcp import Client, StdioServerParameters
 from mcp_support import ROOT, Services, modern_call, modern_headers, sdk_client
+from otel_receiver import Receiver
 
 
 def percentile(samples, fraction):
@@ -83,6 +85,9 @@ async def measure(services, route, transport_name, size, concurrency, requests):
                 "WAYFRAME_TRANSPORT": "stdio",
                 "WAYFRAME_LOCAL_TOKEN": services.tokens["reader"],
             }
+            if "WAYFRAME_STATE_FILE" in env:
+                # Each sequential stdio process owns independent local control-plane state.
+                env["WAYFRAME_STATE_FILE"] = str(services.directory / "stdio-state.json")
             for _ in range(concurrency):
                 clients.append(
                     await stack.enter_async_context(
@@ -236,6 +241,23 @@ async def scenario(args, transport_name, response_format, size, concurrency, was
         unix=transport_name == "unix",
         benchmark=True,
     )
+    receiver = Receiver(retain=0) if args.trace_protocol else None
+    case = None
+    if args.managed:
+        services.env.update(
+            WAYFRAME_STATE_FILE=str(services.directory / "state.json"),
+            WAYFRAME_ADMIN_TOKEN=secrets.token_hex(32),
+        )
+    if receiver:
+        services.env.update(
+            OTEL_EXPORTER_OTLP_ENDPOINT=receiver.endpoint,
+            OTEL_EXPORTER_OTLP_PROTOCOL=args.trace_protocol,
+            OTEL_TRACES_SAMPLER="traceidratio",
+            OTEL_TRACES_SAMPLER_ARG=str(args.trace_sample_ratio),
+        )
+    else:
+        # Baselines must not inherit an unrelated exporter from the caller's environment.
+        services.env = {k: v for k, v in services.env.items() if not k.startswith("OTEL_")}
     try:
         await services.start()
         async with sdk_client(
@@ -284,7 +306,7 @@ async def scenario(args, transport_name, response_format, size, concurrency, was
             )
             for r in rounds
         )
-        return {
+        case = {
             "transport": transport_name,
             "response_format": response_format,
             "value_bytes": size,
@@ -308,8 +330,16 @@ async def scenario(args, transport_name, response_format, size, concurrency, was
             ),
             "rounds": rounds,
         }
+        return case
     finally:
         services.close()
+        if receiver:
+            summary = receiver.summary()
+            receiver.close()
+            if receiver.errors or (args.trace_sample_ratio == 1 and not summary):
+                raise RuntimeError("OTLP benchmark receiver failed or received no spans")
+            if case is not None:
+                case["trace_step_timings"] = summary
 
 
 async def run(args):
@@ -347,6 +377,9 @@ async def run(args):
             "binary": args.binary.name,
         },
         "method": {
+            "management": "persistent" if args.managed else "static bootstrap",
+            "trace_protocol": args.trace_protocol,
+            "trace_sample_ratio": args.trace_sample_ratio if args.trace_protocol else None,
             "requests_per_round": args.requests,
             "rounds": args.rounds,
             "warmup": "50 sequential requests and one per concurrent worker; not timed",
@@ -453,11 +486,15 @@ def main():
     parser.add_argument("--transports", default="tcp,unix,https,stdio")
     parser.add_argument("--formats", default="json,sse")
     parser.add_argument("--native-only", action="store_true")
+    parser.add_argument("--managed", action="store_true", help="enable durable admin/user state")
+    parser.add_argument("--trace-protocol", choices=["http/protobuf", "http/json"])
+    parser.add_argument("--trace-sample-ratio", type=float, default=1.0)
     parser.add_argument("--skip-boundaries", action="store_true")
     parser.add_argument("--policy-runs", type=int, default=2000)
     args = parser.parse_args()
     if (
-        not 100 <= args.requests <= 100000
+        not 0 <= args.trace_sample_ratio <= 1
+        or not 100 <= args.requests <= 100000
         or not 1 <= args.rounds <= 20
         or any(c < 1 or c > 128 for c in args.concurrency)
         or any(n < 1 or n > 16384 for n in args.payloads)

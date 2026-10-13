@@ -541,6 +541,7 @@ mod tests {
             identity: None,
             body: None,
             operation: None,
+            extensions: Default::default(),
             deadline: Instant::now() + Duration::from_secs(3),
         }
     }
@@ -623,6 +624,7 @@ mod failure_tests {
             identity: None,
             body: None,
             operation: None,
+            extensions: Default::default(),
             deadline: Instant::now() + Duration::from_secs(2),
         }
     }

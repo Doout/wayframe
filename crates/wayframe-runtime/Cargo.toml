@@ -13,3 +13,8 @@ workspace = true
 wayframe-core = { path = "../wayframe-core" }
 tokio.workspace = true
 arc-swap.workspace = true
+
+tracing = { workspace = true, optional = true }
+
+[features]
+tracing = ["dep:tracing"]

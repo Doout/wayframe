@@ -24,6 +24,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{timeout_at, Instant},
 };
+use tracing::Instrument;
 use wayframe_core::{Decision, Reason};
 use wayframe_runtime::Pipeline;
 
@@ -306,8 +307,59 @@ impl HttpGateway {
         }
     }
     pub async fn handle(self: &Arc<Self>, peer: SocketAddr, request: Request<Body>) -> Response {
+        use tracing::Instrument;
+        let span = tracing::info_span!("gateway.request", otel.kind = "server", http.request.method = %request.method(), http.response.status_code = tracing::field::Empty, request.id = tracing::field::Empty, mcp.method = tracing::field::Empty, mcp.tool = tracing::field::Empty, stream.outcome = tracing::field::Empty, otel.status_code = tracing::field::Empty);
+        #[cfg(feature = "otel")]
+        {
+            use opentelemetry::propagation::TextMapPropagator;
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            struct Headers<'a>(&'a http::HeaderMap);
+            impl opentelemetry::propagation::Extractor for Headers<'_> {
+                fn get(&self, key: &str) -> Option<&str> {
+                    self.0.get(key).and_then(|v| v.to_str().ok())
+                }
+                fn keys(&self) -> Vec<&str> {
+                    self.0.keys().map(|k| k.as_str()).collect()
+                }
+            }
+            let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                .extract(&Headers(request.headers()));
+            let _ = span.set_parent(parent);
+        }
+        let mut response = self
+            .handle_inner(peer, request)
+            .instrument(span.clone())
+            .await;
+        span.record("http.response.status_code", response.status().as_u16());
+        if response.status().is_server_error() {
+            span.record("otel.status_code", "ERROR");
+        }
+        #[cfg(feature = "otel")]
+        {
+            use opentelemetry::trace::TraceContextExt;
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            let context = span.context();
+            if context.span().span_context().is_valid() {
+                response.headers_mut().insert(
+                    "x-wayframe-trace-id",
+                    context
+                        .span()
+                        .span_context()
+                        .trace_id()
+                        .to_string()
+                        .parse()
+                        .expect("trace id"),
+                );
+            }
+        }
+        response
+    }
+    async fn handle_inner(self: &Arc<Self>, peer: SocketAddr, request: Request<Body>) -> Response {
         self.metrics.requests.fetch_add(1, Ordering::Relaxed);
-        let Ok(permit) = self.admission.clone().try_acquire_owned() else {
+        let admission_span = tracing::info_span!("gateway.admission");
+        let admission = admission_span.in_scope(|| self.admission.clone().try_acquire_owned());
+        drop(admission_span);
+        let Ok(permit) = admission else {
             self.metrics.overload.fetch_add(1, Ordering::Relaxed);
             return rejection(Reason::Unavailable, "overloaded");
         };
@@ -367,6 +419,7 @@ impl HttpGateway {
         }
         let mut ctx = RequestContext::new(request.method().clone(), path, peer.ip(), deadline);
         ctx.request_id = self.sequence.fetch_add(1, Ordering::Relaxed);
+        tracing::Span::current().record("request.id", ctx.request_id);
         ctx.headers = request.headers().clone();
         if let Some(response) = self.deny(self.preflight.evaluate(&mut ctx).await) {
             return response;
@@ -380,7 +433,10 @@ impl HttpGateway {
                 )
                     .into_response();
             }
-            let bytes = match timeout_at(deadline, to_bytes(original_body, maximum)).await {
+            let bytes = match timeout_at(deadline, to_bytes(original_body, maximum))
+                .instrument(tracing::info_span!("gateway.body.inspect"))
+                .await
+            {
                 Ok(Ok(bytes)) => bytes,
                 Ok(Err(_)) => return rejection(Reason::PayloadTooLarge, "inspection_body_limit"),
                 Err(_) => return rejection(Reason::DeadlineExceeded, "body_deadline"),
@@ -397,7 +453,14 @@ impl HttpGateway {
             original_body
         };
         let inspected_length = ctx.body.as_ref().map(bytes::Bytes::len);
-        if let Some(response) = self.deny(self.policy.evaluate(&mut ctx).await) {
+        let policy_decision = self.policy.evaluate(&mut ctx).await;
+        if let Some(op) = &ctx.operation {
+            tracing::Span::current().record("mcp.method", op.action.as_str());
+            if let Some(tool) = &op.target {
+                tracing::Span::current().record("mcp.tool", tool.as_str());
+            }
+        }
+        if let Some(response) = self.deny(policy_decision) {
             return response;
         }
         // Policies inspect canonical paths; forwarding uses the same canonical path.
@@ -406,6 +469,34 @@ impl HttpGateway {
         target.set_query(parts.uri.query());
         stream::strip_hop_headers(&mut parts.headers);
         stream::strip_client_identity(&mut parts.headers);
+        // Never forward arbitrary client baggage or an unvalidated trace context.
+        for name in ["traceparent", "tracestate", "baggage"] {
+            parts.headers.remove(name);
+        }
+        let upstream_span = tracing::info_span!(
+            "gateway.upstream",
+            otel.kind = "client",
+            http.response.status_code = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty
+        );
+        #[cfg(feature = "otel")]
+        {
+            use opentelemetry::propagation::TextMapPropagator;
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            struct Headers<'a>(&'a mut http::HeaderMap);
+            impl opentelemetry::propagation::Injector for Headers<'_> {
+                fn set(&mut self, key: &str, value: String) {
+                    if let (Ok(key), Ok(value)) = (
+                        http::header::HeaderName::from_bytes(key.as_bytes()),
+                        http::HeaderValue::from_str(&value),
+                    ) {
+                        self.0.insert(key, value);
+                    }
+                }
+            }
+            opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                .inject_context(&upstream_span.context(), &mut Headers(&mut parts.headers));
+        }
         if let Some(length) = inspected_length {
             parts.headers.insert(
                 http::header::CONTENT_LENGTH,
@@ -429,15 +520,27 @@ impl HttpGateway {
         if let Some(token) = &self.upstream_token {
             upstream = upstream.bearer_auth(token);
         }
-        let result = match timeout_at(deadline, upstream.send()).await {
+        let result = match timeout_at(deadline, upstream.send())
+            .instrument(upstream_span.clone())
+            .await
+        {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => {
+                upstream_span.record("otel.status_code", "ERROR");
                 self.metrics.upstream_errors.fetch_add(1, Ordering::Relaxed);
                 return (StatusCode::BAD_GATEWAY, "upstream failed").into_response();
             }
-            Err(_) => return rejection(Reason::DeadlineExceeded, "upstream_deadline"),
+            Err(_) => {
+                upstream_span.record("otel.status_code", "ERROR");
+                return rejection(Reason::DeadlineExceeded, "upstream_deadline");
+            }
         };
         let status = result.status();
+        upstream_span.record("http.response.status_code", status.as_u16());
+        if status.is_client_error() || status.is_server_error() {
+            upstream_span.record("otel.status_code", "ERROR");
+        }
+        drop(upstream_span);
         let mut headers = result.headers().clone();
         stream::strip_hop_headers(&mut headers);
         if result
@@ -446,6 +549,7 @@ impl HttpGateway {
         {
             return (StatusCode::BAD_GATEWAY, "upstream response too large").into_response();
         }
+        let expected_bytes = result.content_length();
         let output = stream::constrained(
             result.bytes_stream(),
             limits.max_response_bytes,
@@ -455,11 +559,55 @@ impl HttpGateway {
             true,
         );
         let generation = self.clone();
+        let request_span = tracing::Span::current();
+        let stream_span = tracing::info_span!(
+            "gateway.response.stream",
+            stream.outcome = tracing::field::Empty
+        );
+        struct Completion {
+            stream: tracing::Span,
+            request: tracing::Span,
+            done: bool,
+            expected: Option<u64>,
+            consumed: u64,
+        }
+        impl Drop for Completion {
+            fn drop(&mut self) {
+                // The OTEL layer timestamps the last exit, so close both scopes at body disposal.
+                self.request.in_scope(|| {
+                    self.stream.in_scope(|| {
+                        if !self.done {
+                            let outcome = if self.expected == Some(self.consumed) {
+                                "complete"
+                            } else {
+                                "cancelled"
+                            };
+                            self.request.record("stream.outcome", outcome);
+                            self.stream.record("stream.outcome", outcome);
+                        }
+                    })
+                });
+            }
+        }
+        // Captured outside the generator so an unpolled/dropped body also closes its trace.
+        let completion = Completion {
+            request: request_span,
+            stream: stream_span,
+            done: false,
+            expected: expected_bytes,
+            consumed: 0,
+        };
         let stream = async_stream::stream! {
+            let mut completion = completion;
             let _active = active; // retain the admission permit until EOF or disconnect
             let _generation = generation; // retain old policy/pool resources through streaming
             tokio::pin!(output);
-            while let Some(chunk) = output.next().await { yield chunk; }
+            while let Some(chunk) = output.next().instrument(completion.stream.clone()).await {
+                if chunk.is_err() { completion.request.record("otel.status_code", "ERROR"); completion.request.record("stream.outcome", "error"); completion.stream.record("stream.outcome", "error"); completion.done = true; }
+                if let Ok(bytes) = &chunk { completion.consumed += bytes.len() as u64; }
+                yield chunk;
+            }
+            if !completion.done { completion.request.record("stream.outcome", "complete"); completion.stream.record("stream.outcome", "complete"); completion.done = true; }
         };
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = status;

@@ -1,0 +1,13 @@
+{
+  "tools": {
+    "get_note": "notes:read",
+    "put_note": "notes:write",
+    "delete_note": "notes:write",
+    "admin_preview": "notes:admin"
+  },
+  "denied_tools": [],
+  "rate_limits": [
+    {"id": "default", "user": null, "tool": null, "requests_per_second": 100.0, "burst": 200},
+    {"id": "write-budget", "user": null, "tool": "put_note", "requests_per_second": 5.0, "burst": 10}
+  ]
+}

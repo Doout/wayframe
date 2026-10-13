@@ -33,7 +33,10 @@ The loader admits operator-owned regular files with relative component paths and
 it is not a hardened shared writable artifact store. Do not let tenants replace files, directories
 or manifests. There is no unsafe native-AOT deserialization cache in this version.
 
-The example uses independent static development tokens, not OAuth. Never commit them. Do not
+The example supports independent development tokens and optional managed users with hashed
+random bearer tokens, rotation/revocation, an authenticated admin API, and local persistent rules.
+Management uses a distinct credential, revision preconditions, bounded private files, and one
+process per state file; it is not OAuth or a distributed identity store. Never commit them. Do not
 reuse client tokens for an upstream service, accept client-supplied `x-*` identity headers, or grant
 permissions from MCP `clientInfo` or annotations. JWT support uses one configured RS256 public key
 and explicit issuer/audience validation; there is no OIDC discovery or JWKS refresh and JWT claims
@@ -48,8 +51,7 @@ is a hardened production HTTP service.
 
 Per-stream byte pacing is not aggregate bandwidth enforcement. Per-process limits multiply across
 replicas. Bodies exceeding a limit after response headers are sent terminate the stream. Work with
-side effects requires an explicit idempotency/retry policy; the demo performs no side effects and
-retries no upstream tool calls. Request/response credentials and argument payloads are not logged.
+side effects requires an explicit idempotency/retry policy; the notes example performs actual writes and the gateway retries no upstream tool calls. Request/response credentials and argument payloads are not logged.
 
 ## Release gates
 

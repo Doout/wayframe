@@ -44,7 +44,8 @@ and [block authoring guide](docs/blocks.md).
 ## MCP gateway
 
 The configurable gateway fronts an MCP server with authentication, tool permissions, limits,
-session ownership, and optional Wasm policy. It supports TCP HTTP, HTTP over Unix sockets, a
+session ownership, and optional Wasm policy. An authenticated admin API and CLI manage persistent
+users, tool controls, and scoped rate rules. OTLP traces time each gateway and policy step. It supports TCP HTTP, HTTP over Unix sockets, a
 stdio frontend, and verified HTTPS upstreams.
 
 The [notes example](examples/notes-server/README.md) uses the official MCP SDK and performs real
@@ -52,7 +53,8 @@ SQLite writes, reads, and deletes. The integration tests verify persisted result
 session isolation, denied writes, and the supported transports.
 
 See [gateway setup](examples/mcp-gateway/README.md) to run it against the notes service or your
-own MCP tools server. Configure full upstream URLs, client identities, tool grants, and limits in
+own MCP tools server. See [user management](docs/management.md) and [OTEL tracing](docs/observability.md)
+for operational controls. Configure full upstream URLs, client identities, tool grants, and limits in
 TOML; credentials come from named environment variables.
 
 The smaller read-only fixture is also available:

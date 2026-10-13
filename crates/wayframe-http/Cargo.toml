@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 wayframe-core = { path = "../wayframe-core" }
-wayframe-runtime = { path = "../wayframe-runtime" }
+wayframe-runtime = { path = "../wayframe-runtime", features = ["tracing"] }
 anyhow.workspace = true
 http.workspace = true
 bytes.workspace = true
@@ -21,3 +21,11 @@ reqwest.workspace = true
 async-stream.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
+
+tracing.workspace = true
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[features]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]

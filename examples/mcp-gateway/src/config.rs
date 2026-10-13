@@ -217,9 +217,11 @@ impl Config {
         Ok((url.origin().ascii_serialization(), url.path().into()))
     }
     pub fn credentials(&self) -> Result<Credentials> {
+        let restored =
+            std::env::var_os("WAYFRAME_STATE_FILE").is_some_and(|p| Path::new(&p).exists());
         let mut seen = HashSet::new();
         let mut clients = Vec::new();
-        for c in &self.clients {
+        for c in self.clients.iter().filter(|_| !restored) {
             let token = secret(&c.token_env)?;
             ensure!(
                 seen.insert(token.clone()),

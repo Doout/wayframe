@@ -116,6 +116,16 @@ terminal. Compilation and clean-instance preparation finish before a listener is
 a configured client with `gateway:metrics` permission and returns request, active, denial,
 overload, upstream-error, and byte counters. Neither endpoint is forwarded upstream.
 
+## Users, controls, and traces
+
+Enable persistent users and live policy changes with the [admin API and CLI](../../docs/management.md).
+Tokens can be issued, rotated, disabled, and revoked; tool controls and user/tool rate rules take
+effect without a restart. Management uses a separate admin credential and private state file.
+
+[OTEL tracing](../../docs/observability.md) exports request, admission, individual policy, body,
+upstream, response-stream, and management-persistence durations. It supports W3C correlation and
+optional sampling. Export is opt-in, and arguments/credentials are excluded.
+
 ## Test and benchmark
 
 ```bash

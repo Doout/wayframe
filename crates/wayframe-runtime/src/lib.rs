@@ -35,15 +35,35 @@ impl<C: Context> Pipeline<C> {
             return Decision::expired();
         }
         for block in self.plan.blocks() {
-            let result = match block.execute(context) {
-                Execution::Immediate(result) => result,
-                Execution::Deferred(future) => {
-                    match tokio::time::timeout_at(deadline.into(), future).await {
-                        Ok(result) => result,
-                        Err(_) => return Decision::expired(),
+            let run = async {
+                let result = match block.execute(context) {
+                    Execution::Immediate(result) => result,
+                    Execution::Deferred(future) => {
+                        match tokio::time::timeout_at(deadline.into(), future).await {
+                            Ok(result) => result,
+                            Err(_) => Decision::expired(),
+                        }
+                    }
+                };
+                #[cfg(feature = "tracing")]
+                match &result {
+                    Decision::Continue => {
+                        tracing::Span::current().record("decision", "continue");
+                    }
+                    Decision::Deny { code, .. } => {
+                        tracing::Span::current().record("decision", "deny");
+                        tracing::Span::current().record("denial.code", code);
                     }
                 }
+                result
             };
+            #[cfg(feature = "tracing")]
+            let result = {
+                use tracing::Instrument;
+                run.instrument(tracing::info_span!("policy.step", block.id = block.id(), block.phase = ?block.phase(), decision = tracing::field::Empty, denial.code = tracing::field::Empty)).await
+            };
+            #[cfg(not(feature = "tracing"))]
+            let result = run.await;
             if result != Decision::Continue {
                 return result;
             }

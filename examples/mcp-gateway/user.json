@@ -1,0 +1,7 @@
+{
+  "id": "alice",
+  "subject": "alice",
+  "tenant": "notes",
+  "permissions": ["notes:read", "notes:write"],
+  "enabled": true
+}

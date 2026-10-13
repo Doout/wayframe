@@ -1,21 +1,23 @@
 //! Configurable reference gateway, embedded in an application rather than installed by the framework.
 mod config;
+mod management;
 mod session;
 mod stdio;
+mod telemetry;
 use anyhow::{ensure, Result};
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
     http::{Request, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use std::{net::SocketAddr, sync::Arc};
 use wayframe::{
-    controls::{BearerTokens, OriginGuard, RateLimit},
+    controls::OriginGuard,
     http::{rejection, HttpGateway, Identity, Operation, RequestContext},
-    mcp::{McpGuard, ToolPermissions},
+    mcp::McpGuard,
     prelude::*,
 };
 
@@ -35,7 +37,8 @@ impl Block<RequestContext> for UpstreamPath {
 #[derive(Clone)]
 struct App {
     gateway: Arc<HttpGateway>,
-    auth: Arc<BearerTokens>,
+    store: Arc<management::Store>,
+    hosts: Arc<Vec<String>>,
     sessions: Arc<session::Sessions>,
 }
 impl App {
@@ -98,7 +101,7 @@ async fn metrics(State(app): State<App>, request: Request<Body>) -> Response {
         tokio::time::Instant::now() + std::time::Duration::from_secs(1),
     );
     ctx.headers = request.headers().clone();
-    let decision = app.auth.execute(&mut ctx).resolve().await;
+    let decision = app.store.authenticate(&mut ctx);
     if let Decision::Deny { reason, code } = decision {
         return rejection(reason, code);
     }
@@ -113,12 +116,7 @@ async fn metrics(State(app): State<App>, request: Request<Body>) -> Response {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let _telemetry = telemetry::init()?;
     let config = config::Config::load()?;
     let transport = std::env::var("WAYFRAME_TRANSPORT").unwrap_or_else(|_| "http".into());
     ensure!(
@@ -134,24 +132,22 @@ async fn main() -> Result<()> {
         upstream_token,
     } = config.credentials()?;
     let (origin, path) = config.endpoint()?;
-    let auth = Arc::new(BearerTokens::new("auth".into(), clients).map_err(anyhow::Error::msg)?);
+    let store = management::Store::open(&config, clients, upstream_token.as_deref())?;
+    let managed = |control| {
+        Arc::new(management::ManagedBlock {
+            store: store.clone(),
+            control,
+        }) as Arc<dyn Block<RequestContext>>
+    };
     let sessions = Arc::new(session::Sessions::new());
     let preflight = Pipeline::compile(vec![
         Arc::new(
             OriginGuard::new("origin".into(), config.allowed_origins.clone())
                 .map_err(anyhow::Error::msg)?,
         ) as Arc<dyn Block<RequestContext>>,
-        auth.clone(),
+        managed(management::Control::Authenticate),
         sessions.clone(),
-        Arc::new(
-            RateLimit::new(
-                "rate".into(),
-                config.requests_per_second,
-                config.burst,
-                config.clients.len(),
-            )
-            .map_err(anyhow::Error::msg)?,
-        ),
+        managed(management::Control::Rate),
     ])?;
     let mut policy: Vec<Arc<dyn Block<RequestContext>>> = vec![
         Arc::new(
@@ -160,10 +156,7 @@ async fn main() -> Result<()> {
                 .allow_legacy(true)
                 .allow_sessions(true),
         ),
-        Arc::new(
-            ToolPermissions::new("tool-permissions".into(), config.tools.clone())
-                .map_err(anyhow::Error::msg)?,
-        ),
+        managed(management::Control::Authorize),
     ];
     #[cfg(feature = "wasm")]
     if let Ok(path) = std::env::var("WAYFRAME_PLUGIN_MANIFEST") {
@@ -179,6 +172,7 @@ async fn main() -> Result<()> {
         std::env::var_os("WAYFRAME_PLUGIN_MANIFEST").is_none(),
         "build with --features wasm to load a plugin"
     );
+    policy.push(managed(management::Control::ToolRate));
     policy.push(Arc::new(UpstreamPath(path)));
     let mut builder = HttpGateway::builder(origin)
         .preflight(preflight)
@@ -195,9 +189,35 @@ async fn main() -> Result<()> {
     let gateway = builder.build()?;
     let app = App {
         gateway: gateway.clone(),
-        auth,
+        store,
+        hosts: Arc::new(config.allowed_hosts.clone()),
         sessions,
     };
+    let admin_task = if let Ok(address) = std::env::var("WAYFRAME_ADMIN_LISTEN") {
+        ensure!(app.store.managed(), "admin listener requires managed state");
+        let address: SocketAddr = address.parse()?;
+        ensure!(
+            address.ip().is_loopback(),
+            "admin listener must bind to loopback"
+        );
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let mut admin_app = app.clone();
+        admin_app.hosts = Arc::new(vec![address.to_string()]);
+        Some(tokio::spawn(async move {
+            axum::serve(listener, admin_router().with_state(admin_app)).await
+        }))
+    } else {
+        None
+    };
+    struct AdminTask(Option<tokio::task::JoinHandle<std::io::Result<()>>>);
+    impl Drop for AdminTask {
+        fn drop(&mut self) {
+            if let Some(task) = &self.0 {
+                task.abort();
+            }
+        }
+    }
+    let _admin_task = AdminTask(admin_task);
     if transport == "stdio" {
         let token = config::secret("WAYFRAME_LOCAL_TOKEN")?;
         stdio::run(
@@ -282,12 +302,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 fn router() -> Router<App> {
-    Router::new()
+    admin_router()
         .route(
             "/healthz",
             get(|| async { Json(serde_json::json!({"alive":true})) }),
         )
         .route("/metrics", get(metrics))
+}
+fn admin_router() -> Router<App> {
+    Router::new().route("/admin/{*path}", axum::routing::any(admin))
+}
+async fn admin(State(app): State<App>, request: Request<Body>) -> Response {
+    use tracing::Instrument;
+    let mut hosts = request.headers().get_all("host").iter();
+    if !hosts.next().and_then(|h| h.to_str().ok()).is_some_and(|h| {
+        app.hosts
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(h))
+    }) || hosts.next().is_some()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    app.store
+        .admin(request)
+        .instrument(tracing::info_span!("admin.request", otel.kind = "server"))
+        .await
 }
 async fn stop_signal() {
     #[cfg(unix)]

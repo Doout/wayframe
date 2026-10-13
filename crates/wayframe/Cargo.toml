@@ -21,6 +21,7 @@ wayframe-wasm = { path = "../wayframe-wasm", optional = true }
 [features]
 default = []
 http = ["dep:wayframe-http"]
+otel = ["http", "wayframe-http/otel"]
 controls = ["http", "dep:wayframe-blocks"]
 transport = ["http", "dep:wayframe-transport"]
 mcp = ["http", "dep:wayframe-mcp"]

@@ -68,3 +68,7 @@ spread, checksum, and added nanoseconds above an empty plan. It excludes HTTP, T
 Run on an otherwise idle machine and retain environment, raw samples, and configuration when
 comparing changes. Fuzzing, overload/fault tests, deployment-scale measurements, and independent
 security review remain release qualification work.
+
+To measure durable user management and sampled/unsampled OTLP instrumentation, see the
+[tracing benchmark](observability.md#verify-and-measure). Exported step timings are wall time
+and include exporter/instrumentation effects; compare the same workload and sampling settings.

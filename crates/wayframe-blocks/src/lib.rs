@@ -314,6 +314,7 @@ mod auth_tests {
             identity: None,
             body: None,
             operation: None,
+            extensions: Default::default(),
             deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         }
     }

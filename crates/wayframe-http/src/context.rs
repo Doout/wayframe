@@ -45,6 +45,8 @@ pub struct RequestContext {
     /// Populated only on explicitly body-inspecting routes, after preflight admission/auth.
     pub body: Option<Bytes>,
     pub operation: Option<Operation>,
+    /// Application-owned trusted per-request state; never serialized or copied to headers.
+    pub extensions: http::Extensions,
 }
 impl RequestContext {
     pub fn new(method: Method, path: String, peer_ip: IpAddr, deadline: Instant) -> Self {
@@ -58,6 +60,7 @@ impl RequestContext {
             deadline,
             body: None,
             operation: None,
+            extensions: http::Extensions::new(),
         }
     }
 }
