@@ -40,6 +40,7 @@ Async nodes must cooperate with cancellation. Dropping an execution drops its fu
 leases; no work is detached by the scheduler. `run_finally` runs one synchronous cleanup callback on
 success, failure or cancellation, without replacing a denial. Keep sync nodes short. Use `CpuPool`
 for blocking/CPU work: running closures retain capacity after caller timeout until the work exits.
+Queued CPU closures are cancelled when their caller exits and check the deadline before starting.
 `Exclusive<T>` provides single-use ownership for a body, frame stream or other exclusive resource.
 
 `wayframe-http::workflow::FlowBlock` connects a graph through an explicit immutable projection and

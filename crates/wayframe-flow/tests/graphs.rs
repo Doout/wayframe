@@ -301,6 +301,69 @@ async fn cancelling_the_caller_drops_parallel_work() {
     assert_eq!(gone.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
+async fn expired_cpu_work_never_starts_even_when_capacity_is_available() {
+    let pool = CpuPool::new(1).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let check = calls.clone();
+    assert_eq!(
+        pool.run(
+            tokio::time::Instant::now() - Duration::from_secs(1),
+            move || {
+                check.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        )
+        .await,
+        Err(Error::Deadline)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn cancelling_queued_cpu_work_prevents_it_from_starting() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (entered, observe) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        observe.await.unwrap();
+        let pool = CpuPool::new(1).unwrap();
+        let queued = pool.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let check = calls.clone();
+        let task = tokio::spawn(async move {
+            queued
+                .run(
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    move || {
+                        check.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        pool.run(tokio::time::Instant::now() + Duration::from_secs(1), || {
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[tokio::test]
 async fn cpu_timeout_keeps_running_work_accounted_and_quorum_cancels_losers() {
     let pool = CpuPool::new(1).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();

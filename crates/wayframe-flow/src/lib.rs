@@ -832,14 +832,31 @@ impl CpuPool {
         T: Send + 'static,
         F: FnOnce() -> Result<T, Error> + Send + 'static,
     {
+        if Instant::now() >= deadline {
+            return Err(Error::Deadline);
+        }
         let permit = timeout_at(deadline, self.0.clone().acquire_owned())
             .await
             .map_err(|_| Error::Deadline)?
             .map_err(|_| Error::Overloaded)?;
+        if Instant::now() >= deadline {
+            return Err(Error::Deadline);
+        }
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            if Instant::now() >= deadline {
+                return Err(Error::Deadline);
+            }
             f()
         });
+        struct CancelQueued(tokio::task::AbortHandle);
+        impl Drop for CancelQueued {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        // Tokio can cancel a queued blocking closure; running work still owns its permit.
+        let _cancel = CancelQueued(task.abort_handle());
         timeout_at(deadline, task)
             .await
             .map_err(|_| Error::Deadline)?
