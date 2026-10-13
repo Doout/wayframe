@@ -18,6 +18,7 @@ python3 -m unittest discover -s examples/mcp-server/tests -v
 cargo fmt --all -- --check
 cargo fmt --manifest-path plugins/path-control/Cargo.toml -- --check
 cargo check --locked -p wayframe --no-default-features
+cargo check --locked -p wayframe --no-default-features --features lb
 cargo test --locked --workspace --all-features --all-targets
 cargo test --locked --workspace --all-features --doc
 cargo clippy --locked --workspace --all-features --all-targets -- -D warnings

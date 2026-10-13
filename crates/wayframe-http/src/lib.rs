@@ -1,7 +1,13 @@
 //! Opt-in HTTP adapter. Applications own listeners, routes and deployment policy.
 //! This crate never requires MCP, WebAssembly, a registry, or a management service.
+#[cfg(feature = "lb")]
+mod backend;
 mod context;
 pub mod stream;
+#[cfg(feature = "lb")]
+pub use backend::{BackendId, Upstream};
+#[cfg(feature = "lb")]
+pub use context::PinnedBackend;
 pub use context::{Identity, Operation, RequestContext};
 
 use anyhow::{ensure, Result};
@@ -173,6 +179,10 @@ pub struct GatewayBuilder {
     authorities: Vec<String>,
     upstream_token: Option<String>,
     upstream_ca: Option<Vec<u8>>,
+    #[cfg(feature = "lb")]
+    upstreams: Vec<Upstream>,
+    #[cfg(feature = "lb")]
+    failure_cooldown: Duration,
 }
 impl GatewayBuilder {
     pub fn new(origin: impl Into<String>) -> Self {
@@ -185,6 +195,10 @@ impl GatewayBuilder {
             authorities: Vec::new(),
             upstream_token: None,
             upstream_ca: None,
+            #[cfg(feature = "lb")]
+            upstreams: Vec::new(),
+            #[cfg(feature = "lb")]
+            failure_cooldown: Duration::from_secs(1),
         }
     }
     /// Authentication and cheap admission run before collecting a body.
@@ -219,6 +233,17 @@ impl GatewayBuilder {
     /// Trust an operator-provided CA in addition to the public roots; certificate checks remain enabled.
     pub fn upstream_ca(mut self, pem: Vec<u8>) -> Self {
         self.upstream_ca = Some(pem);
+        self
+    }
+    /// Register full, fixed endpoints selected by an LB block. A selection is mandatory when nonempty.
+    #[cfg(feature = "lb")]
+    pub fn upstreams(mut self, upstreams: Vec<Upstream>) -> Self {
+        self.upstreams = upstreams;
+        self
+    }
+    #[cfg(feature = "lb")]
+    pub fn failure_cooldown(mut self, duration: Duration) -> Self {
+        self.failure_cooldown = duration;
         self
     }
     pub fn build(self) -> Result<Arc<HttpGateway>> {
@@ -256,6 +281,20 @@ impl GatewayBuilder {
             client = client.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
         }
         let client = client.build()?;
+        #[cfg(feature = "lb")]
+        let upstreams = {
+            ensure!(self.upstreams.len() <= 128, "too many backends");
+            ensure!(
+                self.failure_cooldown <= Duration::from_secs(600),
+                "invalid backend cooldown"
+            );
+            let mut prepared = std::collections::HashMap::new();
+            for upstream in self.upstreams {
+                let (id, value) = upstream.prepare()?;
+                ensure!(prepared.insert(id, value).is_none(), "duplicate backend id");
+            }
+            prepared
+        };
         Ok(Arc::new(HttpGateway {
             origin: origin.as_str().trim_end_matches('/').into(),
             preflight: self
@@ -270,6 +309,10 @@ impl GatewayBuilder {
             client,
             metrics: Arc::new(Metrics::default()),
             sequence: AtomicU64::new(1),
+            #[cfg(feature = "lb")]
+            upstreams,
+            #[cfg(feature = "lb")]
+            failure_cooldown: self.failure_cooldown,
         }))
     }
 }
@@ -286,6 +329,10 @@ pub struct HttpGateway {
     admission: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     sequence: AtomicU64,
+    #[cfg(feature = "lb")]
+    upstreams: std::collections::HashMap<String, backend::Prepared>,
+    #[cfg(feature = "lb")]
+    failure_cooldown: Duration,
 }
 impl HttpGateway {
     pub fn builder(origin: impl Into<String>) -> GatewayBuilder {
@@ -308,7 +355,7 @@ impl HttpGateway {
     }
     pub async fn handle(self: &Arc<Self>, peer: SocketAddr, request: Request<Body>) -> Response {
         use tracing::Instrument;
-        let span = tracing::info_span!("gateway.request", otel.kind = "server", http.request.method = %request.method(), http.response.status_code = tracing::field::Empty, request.id = tracing::field::Empty, mcp.method = tracing::field::Empty, mcp.tool = tracing::field::Empty, stream.outcome = tracing::field::Empty, otel.status_code = tracing::field::Empty);
+        let span = tracing::info_span!("gateway.request", otel.kind = "server", http.request.method = %request.method(), http.response.status_code = tracing::field::Empty, request.id = tracing::field::Empty, mcp.method = tracing::field::Empty, mcp.tool = tracing::field::Empty, stream.outcome = tracing::field::Empty, otel.status_code = tracing::field::Empty, lb.backend.id = tracing::field::Empty, lb.strategy = tracing::field::Empty, lb.overflow = tracing::field::Empty);
         #[cfg(feature = "otel")]
         {
             use opentelemetry::propagation::TextMapPropagator;
@@ -463,9 +510,37 @@ impl HttpGateway {
         if let Some(response) = self.deny(policy_decision) {
             return response;
         }
+        #[cfg(feature = "lb")]
+        let selection = ctx.extensions.get::<wayframe_lb::Selection>().cloned();
+        #[cfg(feature = "lb")]
+        let registered = if self.upstreams.is_empty() {
+            if selection.is_some() {
+                return rejection(Reason::Unavailable, "backend_not_registered");
+            }
+            None
+        } else {
+            let Some(selected) = &selection else {
+                return rejection(Reason::Unavailable, "backend_selection_required");
+            };
+            let Some(registered) = self.upstreams.get(selected.backend_id()) else {
+                return rejection(Reason::Unavailable, "backend_not_registered");
+            };
+            Some(registered)
+        };
+        #[cfg(feature = "lb")]
+        if let Some(selected) = &selection {
+            let span = tracing::Span::current();
+            span.record("lb.backend.id", selected.backend_id());
+            span.record("lb.strategy", selected.strategy().as_str());
+            span.record("lb.overflow", selected.overflow());
+        }
         // Policies inspect canonical paths; forwarding uses the same canonical path.
         let mut target: reqwest::Url = self.origin.parse().expect("validated origin");
         target.set_path(&ctx.path);
+        #[cfg(feature = "lb")]
+        if let Some(backend) = registered {
+            target = backend.endpoint.clone();
+        }
         target.set_query(parts.uri.query());
         stream::strip_hop_headers(&mut parts.headers);
         stream::strip_client_identity(&mut parts.headers);
@@ -512,12 +587,15 @@ impl HttpGateway {
             self.metrics.clone(),
             false,
         );
-        let mut upstream = self
-            .client
+        let client = &self.client;
+        let bearer = &self.upstream_token;
+        #[cfg(feature = "lb")]
+        let (client, bearer) = registered.map_or((client, bearer), |b| (&b.client, &b.bearer));
+        let mut upstream = client
             .request(parts.method, target)
             .headers(parts.headers)
             .body(reqwest::Body::wrap_stream(input));
-        if let Some(token) = &self.upstream_token {
+        if let Some(token) = bearer {
             upstream = upstream.bearer_auth(token);
         }
         let result = match timeout_at(deadline, upstream.send())
@@ -527,11 +605,19 @@ impl HttpGateway {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => {
                 upstream_span.record("otel.status_code", "ERROR");
+                #[cfg(feature = "lb")]
+                if let Some(selection) = &selection {
+                    selection.failed(self.failure_cooldown);
+                }
                 self.metrics.upstream_errors.fetch_add(1, Ordering::Relaxed);
                 return (StatusCode::BAD_GATEWAY, "upstream failed").into_response();
             }
             Err(_) => {
                 upstream_span.record("otel.status_code", "ERROR");
+                #[cfg(feature = "lb")]
+                if let Some(selection) = &selection {
+                    selection.failed(self.failure_cooldown);
+                }
                 return rejection(Reason::DeadlineExceeded, "upstream_deadline");
             }
         };
@@ -540,6 +626,14 @@ impl HttpGateway {
         if status.is_client_error() || status.is_server_error() {
             upstream_span.record("otel.status_code", "ERROR");
         }
+        #[cfg(feature = "lb")]
+        if let Some(selected) = &selection {
+            if matches!(status.as_u16(), 502..=504) {
+                selected.failed(self.failure_cooldown);
+            } else {
+                selected.succeeded();
+            }
+        }
         drop(upstream_span);
         let mut headers = result.headers().clone();
         stream::strip_hop_headers(&mut headers);
@@ -547,6 +641,10 @@ impl HttpGateway {
             .content_length()
             .is_some_and(|n| n > limits.max_response_bytes)
         {
+            #[cfg(feature = "lb")]
+            if let Some(selected) = &selection {
+                selected.failed(self.failure_cooldown);
+            }
             return (StatusCode::BAD_GATEWAY, "upstream response too large").into_response();
         }
         let expected_bytes = result.content_length();
@@ -597,12 +695,20 @@ impl HttpGateway {
             expected: expected_bytes,
             consumed: 0,
         };
+        #[cfg(feature = "lb")]
+        let backend_id = selection.as_ref().map(|s| BackendId(s.backend_id().into()));
+        #[cfg(feature = "lb")]
+        let cooldown = self.failure_cooldown;
         let stream = async_stream::stream! {
             let mut completion = completion;
+            #[cfg(feature = "lb")]
+            let selection = selection; // retain one reservation through body disposal/EOF, including an unpolled body
             let _active = active; // retain the admission permit until EOF or disconnect
             let _generation = generation; // retain old policy/pool resources through streaming
             tokio::pin!(output);
             while let Some(chunk) = output.next().instrument(completion.stream.clone()).await {
+                #[cfg(feature = "lb")]
+                if chunk.is_err() { if let Some(selected) = &selection { selected.failed(cooldown); } }
                 if chunk.is_err() { completion.request.record("otel.status_code", "ERROR"); completion.request.record("stream.outcome", "error"); completion.stream.record("stream.outcome", "error"); completion.done = true; }
                 if let Ok(bytes) = &chunk { completion.consumed += bytes.len() as u64; }
                 yield chunk;
@@ -612,6 +718,10 @@ impl HttpGateway {
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = status;
         *response.headers_mut() = headers;
+        #[cfg(feature = "lb")]
+        if let Some(backend_id) = backend_id {
+            response.extensions_mut().insert(backend_id);
+        }
         if let Some(identity) = ctx.identity {
             response.extensions_mut().insert(identity);
         }
@@ -682,5 +792,129 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(g.metrics.active.load(Ordering::Relaxed), 0);
         assert_eq!(g.metrics.upstream_errors.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(all(test, feature = "lb"))]
+mod lb_tests {
+    use super::*;
+    use wayframe_core::{Block, Execution, Phase};
+    use wayframe_lb::{Backend, LoadBalance, Pool, Strategy};
+    fn pool(id: &str) -> Pool {
+        Pool::new(vec![Backend::new(id)]).unwrap()
+    }
+    fn route(pool: &Pool) -> Arc<dyn Block<RequestContext>> {
+        Arc::new(LoadBalance::new(
+            "lb",
+            pool.clone(),
+            Strategy::LeastConnections,
+        ))
+    }
+    #[tokio::test]
+    async fn registered_destinations_require_a_trusted_selection() {
+        let gateway = HttpGateway::builder("http://127.0.0.1:9")
+            .preflight(Pipeline::compile(vec![]).unwrap())
+            .upstreams(vec![Upstream::new("a", "http://127.0.0.1:9/backend")])
+            .build()
+            .unwrap();
+        let response = gateway
+            .handle(
+                "127.0.0.1:1".parse().unwrap(),
+                Request::builder()
+                    .uri("/mcp")
+                    .header("x-wayframe-backend", "a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(gateway.metrics.upstream_errors.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn unknown_selected_id_cannot_fall_back_to_the_default_origin() {
+        let pool = pool("b");
+        let gateway = HttpGateway::builder("http://127.0.0.1:9")
+            .preflight(Pipeline::compile(vec![]).unwrap())
+            .policy(Pipeline::compile(vec![route(&pool)]).unwrap())
+            .upstreams(vec![Upstream::new("a", "http://127.0.0.1:9/backend")])
+            .build()
+            .unwrap();
+        let response = gateway
+            .handle(
+                "127.0.0.1:1".parse().unwrap(),
+                Request::builder().uri("/mcp").body(Body::empty()).unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(pool.snapshot().unwrap()[0].active, 0);
+        assert_eq!(gateway.metrics.upstream_errors.load(Ordering::Relaxed), 0);
+    }
+    struct Deny;
+    impl Block<RequestContext> for Deny {
+        fn id(&self) -> &str {
+            "deny-after-lb"
+        }
+        fn phase(&self) -> Phase {
+            Phase::Dispatch
+        }
+        fn execute<'a>(&'a self, _: &'a mut RequestContext) -> Execution<'a> {
+            Execution::Immediate(Decision::deny(Reason::Forbidden, "denied"))
+        }
+    }
+    #[tokio::test]
+    async fn a_later_denial_releases_the_selected_reservation() {
+        let pool = pool("a");
+        let gateway = HttpGateway::builder("http://127.0.0.1:9")
+            .preflight(Pipeline::compile(vec![]).unwrap())
+            .policy(Pipeline::compile(vec![route(&pool), Arc::new(Deny)]).unwrap())
+            .upstreams(vec![Upstream::new("a", "http://127.0.0.1:9/backend")])
+            .build()
+            .unwrap();
+        let response = gateway
+            .handle(
+                "127.0.0.1:1".parse().unwrap(),
+                Request::builder().uri("/mcp").body(Body::empty()).unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let stats = pool.snapshot().unwrap();
+        assert_eq!(stats[0].active, 0);
+        assert_eq!(stats[0].selected, 1);
+        assert_eq!(gateway.metrics.upstream_errors.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn dropping_an_unpolled_response_releases_its_lease_and_uses_registered_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/backend", axum::routing::get(|| async { "ok" })),
+            )
+            .await
+            .unwrap();
+        });
+        let pool = pool("a");
+        let gateway = HttpGateway::builder("http://127.0.0.1:9")
+            .preflight(Pipeline::compile(vec![]).unwrap())
+            .policy(Pipeline::compile(vec![route(&pool)]).unwrap())
+            .upstreams(vec![Upstream::new(
+                "a",
+                format!("http://{address}/backend"),
+            )])
+            .build()
+            .unwrap();
+        let response = gateway
+            .handle(
+                "127.0.0.1:1".parse().unwrap(),
+                Request::builder().uri("/mcp").body(Body::empty()).unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(pool.snapshot().unwrap()[0].active, 1);
+        assert_eq!(response.extensions().get::<BackendId>().unwrap().0, "a");
+        drop(response);
+        assert_eq!(pool.snapshot().unwrap()[0].active, 0);
+        server.abort();
     }
 }

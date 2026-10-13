@@ -37,6 +37,9 @@ that trace. `x-wayframe-trace-id` on the response helps find it in the backend.
 | `admin.request` | Admin API operation |
 | `admin.persist` | Durable state write before publication; new revision |
 
+With load balancing enabled, request and selection-step spans also record `lb.backend.id`,
+`lb.strategy`, and `lb.overflow`. See [routing controls](load-balancing.md).
+
 Span start/end timestamps provide elapsed time, including waits in deferred blocks. Requests denied
 before dispatch have no upstream span; later policy steps do not run. Root status records the HTTP
 result; server/upstream errors mark OTEL error status. Streaming errors mark the root as an error.

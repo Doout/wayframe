@@ -68,6 +68,13 @@ Both commands build the Rust gateway, generate independent temporary credentials
 requests, and stop the local processes. See the [MCP profile](docs/mcp-profile.md) for capability
 and transport boundaries.
 
+## Load balancing
+
+The optional `lb` feature provides transport-independent blocks for round robin, least connections,
+smooth weighted round robin, and quota priority. The MCP gateway can route to registered replicas,
+pin legacy sessions, and cool down failed backends while retaining reservations through streaming.
+See [load balancing](docs/load-balancing.md) for configuration, typed contexts, and measurement.
+
 ## Workspace
 
 | Package | Responsibility |
@@ -78,6 +85,7 @@ and transport boundaries.
 | `wayframe-http` | Embedded HTTP gateway, streaming, and metadata/body limits |
 | `wayframe-blocks` | Bearer tokens, RS256 JWT, origin controls, and local token buckets |
 | `wayframe-transport` | Bounded task bridge and Unix/HTTPS policy bridges |
+| `wayframe-lb` | Native routing blocks: round robin, least connections, smooth weighted round robin, quota priority |
 | `wayframe-mcp` | Bounded MCP inspection and tool permissions |
 | `wayframe-wasm` | WIT policy runtime, metadata capabilities, and clean prewarming |
 | `wayframe-example-mcp-gateway` | Reference application under `examples/` |
@@ -124,7 +132,7 @@ See [performance methodology](docs/performance.md) before interpreting overhead 
 
 ## Scope
 
-This version supports linear policy pipelines and a fixed upstream origin per HTTP gateway.
+This version supports linear policy pipelines and registered upstream endpoints per HTTP gateway.
 Production ingress TLS, connection-level admission, fleet quotas, OIDC/JWKS refresh, plugin
 signatures and registries, external-worker supervision, distributed graphs, and complete MCP SDK
 conformance are future work. Static demo tokens are for loopback development.

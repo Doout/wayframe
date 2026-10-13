@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "crates/wayframe", "crates/wayframe-core", "crates/wayframe-runtime",
   "crates/wayframe-http", "crates/wayframe-blocks", "crates/wayframe-transport",
-  "crates/wayframe-mcp", "crates/wayframe-wasm", "examples/mcp-gateway",
+  "crates/wayframe-mcp", "crates/wayframe-lb", "crates/wayframe-wasm", "examples/mcp-gateway",
 ]
 default-members = ["crates/wayframe", "crates/wayframe-core", "crates/wayframe-runtime"]
 exclude = ["plugins/path-control"]

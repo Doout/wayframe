@@ -110,6 +110,13 @@ WAYFRAME_PLUGIN_MANIFEST=plugins/path-control/plugin.toml \
 The sample policy denies `admin_preview` even to an operator. Native permission denials remain
 terminal. Compilation and clean-instance preparation finish before a listener is bound.
 
+## Load-balanced replicas
+
+[Load-balancing setup](../../docs/load-balancing.md) covers all four routing strategies and the
+complete [two-replica configuration](notes-lb.toml). The same TCP/Unix/stdio frontends route to
+registered endpoints, preserving backend credentials, TLS verification, and legacy session affinity.
+Reservations remain active until response disposal; passive cooldown affects subsequent calls.
+
 ## Operational endpoints
 
 `GET /healthz` reports listener liveness; it does not probe upstream health. `GET /metrics` requires

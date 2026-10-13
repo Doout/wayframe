@@ -40,6 +40,7 @@ struct App {
     store: Arc<management::Store>,
     hosts: Arc<Vec<String>>,
     sessions: Arc<session::Sessions>,
+    pool: Option<wayframe::lb::Pool>,
 }
 impl App {
     async fn forward(&self, peer: SocketAddr, request: Request<Body>) -> Response {
@@ -69,7 +70,16 @@ impl App {
                 if let Some(old) = &old_session {
                     id == old
                 } else {
-                    response.status().is_success() && initialize && self.sessions.bind(id, identity)
+                    response.status().is_success()
+                        && initialize
+                        && self.sessions.bind_backend(
+                            id,
+                            identity,
+                            response
+                                .extensions()
+                                .get::<wayframe::http::BackendId>()
+                                .map(|b| b.0.clone()),
+                        )
                 }
             });
             if !valid {
@@ -112,7 +122,14 @@ async fn metrics(State(app): State<App>, request: Request<Body>) -> Response {
         return rejection(Reason::Forbidden, "metrics_not_permitted");
     }
     use axum::response::IntoResponse;
-    Json(app.gateway.metrics().snapshot()).into_response()
+    let mut snapshot = app.gateway.metrics().snapshot();
+    if let Some(pool) = &app.pool {
+        let Ok(backends) = pool.snapshot() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        snapshot["load_balancer"] = serde_json::json!({"backends":backends});
+    }
+    Json(snapshot).into_response()
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -130,9 +147,17 @@ async fn main() -> Result<()> {
     let config::Credentials {
         clients,
         upstream_token,
+        backend_tokens,
     } = config.credentials()?;
     let (origin, path) = config.endpoint()?;
-    let store = management::Store::open(&config, clients, upstream_token.as_deref())?;
+    let mut forbidden_tokens: Vec<_> = backend_tokens.values().cloned().collect();
+    forbidden_tokens.extend(upstream_token.iter().cloned());
+    let store = management::Store::open(&config, clients, &forbidden_tokens)?;
+    let pool = config
+        .load_balancer
+        .as_ref()
+        .map(config::LoadBalancerConfig::pool)
+        .transpose()?;
     let managed = |control| {
         Arc::new(management::ManagedBlock {
             store: store.clone(),
@@ -173,6 +198,13 @@ async fn main() -> Result<()> {
         "build with --features wasm to load a plugin"
     );
     policy.push(managed(management::Control::ToolRate));
+    if let (Some(pool), Some(lb)) = (&pool, &config.load_balancer) {
+        policy.push(Arc::new(wayframe::lb::LoadBalance::new(
+            "load-balancer",
+            pool.clone(),
+            lb.strategy,
+        )));
+    }
     policy.push(Arc::new(UpstreamPath(path)));
     let mut builder = HttpGateway::builder(origin)
         .preflight(preflight)
@@ -180,6 +212,29 @@ async fn main() -> Result<()> {
         .inspect_body(config.max_request_bytes)
         .limits(config.limits())
         .authorities(config.allowed_hosts.clone());
+    if let Some(lb) = &config.load_balancer {
+        let mut upstreams = Vec::new();
+        for backend in &lb.backends {
+            let mut upstream = wayframe::http::Upstream::new(&backend.id, &backend.endpoint);
+            upstream.bearer = backend_tokens
+                .get(&backend.id)
+                .cloned()
+                .or_else(|| upstream_token.clone());
+            if let Some(path) = &backend.ca {
+                ensure!(
+                    std::fs::metadata(path)?.len() <= 64 * 1024,
+                    "backend CA too large"
+                );
+                upstream.ca = Some(std::fs::read(path)?);
+            } else {
+                upstream.ca = config.ca()?;
+            }
+            upstreams.push(upstream);
+        }
+        builder = builder
+            .upstreams(upstreams)
+            .failure_cooldown(std::time::Duration::from_millis(lb.failure_cooldown_ms));
+    }
     if let Some(token) = upstream_token {
         builder = builder.upstream_bearer(token);
     }
@@ -192,6 +247,7 @@ async fn main() -> Result<()> {
         store,
         hosts: Arc::new(config.allowed_hosts.clone()),
         sessions,
+        pool,
     };
     let admin_task = if let Ok(address) = std::env::var("WAYFRAME_ADMIN_LISTEN") {
         ensure!(app.store.managed(), "admin listener requires managed state");

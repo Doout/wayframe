@@ -27,5 +27,8 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
+wayframe-lb = { path = "../wayframe-lb", optional = true }
+
 [features]
+lb = ["dep:wayframe-lb", "wayframe-lb/tracing"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]

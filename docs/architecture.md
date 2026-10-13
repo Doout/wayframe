@@ -56,9 +56,10 @@ control plane, preserving the generation through the complete response.
 
 ## HTTP adapter
 
-The builder requires an explicit preflight pipeline and a fixed upstream origin. It rejects URL
-credentials, unsupported schemes, query strings and configured upstream path prefixes. The
-application owns routing and listener configuration. Public-facing TLS is not implemented here.
+The builder requires an explicit preflight pipeline and a fixed default upstream origin. The optional
+LB adapter registers full endpoints and per-backend credentials/trust, selected by a routing block.
+URL credentials, unsupported schemes, query strings, fragments, and ambiguous endpoint paths are
+rejected. The application owns routing and listener configuration. Public-facing TLS is not implemented here.
 
 Requests use bounded in-flight admission, deadline, metadata and body budgets. Without inspection,
 the adapter streams body chunks. Inspection is opt-in and bounded; MCP uses a 32 KiB envelope.
@@ -67,8 +68,9 @@ forwarding. Body mutation through the inspection context is not a supported tran
 the bytes sent upstream remain the inspected original body.
 
 The path policy conservatively rejects ambiguous encodings, encoded separators, double-decoding,
-dot segments and control characters. The HTTP adapter forwards the final canonical path in the context. A trusted application dispatch
-block can map an approved client path to a fixed upstream path; the MCP application maps `/mcp`
+dot segments and control characters. The default forwarding path uses the final canonical path in the context. Registered LB endpoints
+use their fixed configured paths. A trusted application dispatch block can map an approved client
+path to a fixed upstream path; the MCP application maps `/mcp`
 to its configured endpoint. Earlier controls inspect the incoming path and verified operation.
 Hop-by-hop headers, client authorization and spoofable forwarding/identity headers are removed.
 A separately configured gateway-to-upstream credential can be attached. The HTTP client disables

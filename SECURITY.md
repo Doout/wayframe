@@ -11,8 +11,8 @@ policy responses. Privileged plugin installation and configuration publication a
 ## Implemented controls
 
 Terminal denial; bounded pipeline identifiers/cardinality; preflight authentication before optional
-body collection; separate upstream credentials; exact origin checks in the demo; fixed upstream
-origin; removal of spoofed identity/hop headers; no automatic redirects/proxies/retries; conservative
+body collection; separate upstream credentials; exact origin checks in the demo; registered upstream
+origins; removal of spoofed identity/hop headers; no automatic redirects/proxies/retries; conservative
 path normalization; per-request and stream limits; bounded local token-bucket cardinality; bounded
 external frames with correlation and peer validation; narrow Wasm metadata grants; no WASI or
 arbitrary host imports; guest fuel/memory/deadline budgets; fresh single-use guest instances.
@@ -48,6 +48,11 @@ OS resource budgets, downstream deadlines and audit controls in place before pub
 The original standard-library Python server is a read-only fixture. The SDK notes server is a
 loopback persistence example; its shared database is not partitioned by tenant. Neither example
 is a hardened production HTTP service.
+
+Load-balanced endpoints are operator registered; client metadata cannot select arbitrary URLs.
+MCP sessions pin their backend and fail closed when unavailable. Dispatch is never retried.
+Local connection quotas guide routing and intentionally allow last-backend overflow; they are not
+a hard admission cap or distributed quota. Active health probes/shared quota stores are not included.
 
 Per-stream byte pacing is not aggregate bandwidth enforcement. Per-process limits multiply across
 replicas. Bodies exceeding a limit after response headers are sent terminate the stream. Work with

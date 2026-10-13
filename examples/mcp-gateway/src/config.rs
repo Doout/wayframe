@@ -11,6 +11,7 @@ use wayframe::http::{stream::canonical_path, Identity, Limits};
 pub struct Credentials {
     pub clients: Vec<(String, Identity)>,
     pub upstream_token: Option<String>,
+    pub backend_tokens: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +29,7 @@ pub struct Config {
     pub upstream: String,
     pub upstream_token_env: Option<String>,
     pub upstream_ca: Option<String>,
+    pub load_balancer: Option<LoadBalancerConfig>,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
     #[serde(default)]
@@ -46,6 +48,57 @@ pub struct Config {
     pub max_response_bytes: u64,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadBalancerConfig {
+    pub strategy: wayframe::lb::Strategy,
+    pub backends: Vec<BackendConfig>,
+    #[serde(default = "default_cooldown")]
+    pub failure_cooldown_ms: u64,
+}
+fn default_cooldown() -> u64 {
+    1000
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendConfig {
+    pub id: String,
+    pub endpoint: String,
+    pub token_env: Option<String>,
+    pub ca: Option<String>,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    #[serde(default)]
+    pub quota: u32,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+fn default_weight() -> u32 {
+    1
+}
+fn default_enabled() -> bool {
+    true
+}
+impl BackendConfig {
+    pub fn metadata(&self) -> wayframe::lb::Backend {
+        wayframe::lb::Backend {
+            id: self.id.clone(),
+            weight: self.weight,
+            quota: self.quota,
+            priority: self.priority,
+            enabled: self.enabled,
+        }
+    }
+}
+impl LoadBalancerConfig {
+    pub fn pool(&self) -> Result<wayframe::lb::Pool> {
+        wayframe::lb::Pool::new(self.backends.iter().map(BackendConfig::metadata).collect())
+            .map_err(anyhow::Error::msg)
+    }
 }
 fn default_rate() -> f64 {
     100.0
@@ -119,6 +172,7 @@ impl Config {
             upstream: format!("{}/mcp", origin.trim_end_matches('/')),
             upstream_token_env: Some("WAYFRAME_UPSTREAM_TOKEN".into()),
             upstream_ca: None,
+            load_balancer: None,
             allowed_origins: vec![],
             allowed_hosts: vec![],
             clients: vec![
@@ -197,24 +251,20 @@ impl Config {
             );
         }
         self.endpoint()?;
+        if let Some(lb) = &self.load_balancer {
+            lb.pool()?;
+            ensure!(
+                lb.failure_cooldown_ms <= 600_000,
+                "invalid backend cooldown"
+            );
+            for backend in &lb.backends {
+                endpoint(&backend.endpoint)?;
+            }
+        }
         Ok(())
     }
     pub fn endpoint(&self) -> Result<(String, String)> {
-        let url: reqwest::Url = self.upstream.parse()?;
-        ensure!(
-            matches!(url.scheme(), "http" | "https")
-                && url.host_str().is_some()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none(),
-            "upstream must be a fixed HTTP(S) endpoint without credentials/query/fragment"
-        );
-        ensure!(
-            canonical_path(url.path()).as_deref() == Some(url.path()),
-            "upstream path must be canonical"
-        );
-        Ok((url.origin().ascii_serialization(), url.path().into()))
+        endpoint(&self.upstream)
     }
     pub fn credentials(&self) -> Result<Credentials> {
         let restored =
@@ -240,9 +290,23 @@ impl Config {
                 "upstream credential must differ from client credentials"
             );
         }
+        let mut backend_tokens = HashMap::new();
+        if let Some(lb) = &self.load_balancer {
+            for backend in &lb.backends {
+                if let Some(name) = &backend.token_env {
+                    let token = secret(name)?;
+                    ensure!(
+                        !seen.contains(&token),
+                        "backend credential must differ from client credentials"
+                    );
+                    backend_tokens.insert(backend.id.clone(), token);
+                }
+            }
+        }
         Ok(Credentials {
             clients,
             upstream_token: upstream,
+            backend_tokens,
         })
     }
     pub fn ca(&self) -> Result<Option<Vec<u8>>> {
@@ -264,6 +328,24 @@ impl Config {
             ..Limits::default()
         }
     }
+}
+
+fn endpoint(value: &str) -> Result<(String, String)> {
+    let url: reqwest::Url = value.parse()?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "upstream must be a fixed HTTP(S) endpoint without credentials/query/fragment"
+    );
+    ensure!(
+        canonical_path(url.path()).as_deref() == Some(url.path()),
+        "upstream path must be canonical"
+    );
+    Ok((url.origin().ascii_serialization(), url.path().into()))
 }
 
 #[cfg(test)]
@@ -293,6 +375,32 @@ mod tests {
         assert!(toml::from_str::<Config>("unexpected = true").is_err());
         let mut c = Config::demo().unwrap();
         c.max_request_bytes = usize::MAX;
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn load_balancer_config_rejects_unknown_strategies_and_unsafe_backends() {
+        assert!(toml::from_str::<LoadBalancerConfig>("strategy = 'typo'\nbackends = []").is_err());
+        let mut c = Config::demo().unwrap();
+        c.load_balancer = Some(LoadBalancerConfig {
+            strategy: wayframe::lb::Strategy::RoundRobin,
+            failure_cooldown_ms: 1000,
+            backends: vec![BackendConfig {
+                id: "a".into(),
+                endpoint: "https://example.com/mcp".into(),
+                token_env: None,
+                ca: None,
+                weight: 1,
+                quota: 0,
+                priority: 0,
+                enabled: true,
+            }],
+        });
+        assert!(c.validate().is_ok());
+        c.load_balancer.as_mut().unwrap().backends[0].endpoint =
+            "https://u:p@example.com/mcp".into();
+        assert!(c.validate().is_err());
+        c.load_balancer.as_mut().unwrap().backends[0].endpoint = "https://example.com/mcp".into();
+        c.load_balancer.as_mut().unwrap().backends[0].weight = 0;
         assert!(c.validate().is_err());
     }
 }

@@ -60,7 +60,7 @@ impl<C: Context> Pipeline<C> {
             #[cfg(feature = "tracing")]
             let result = {
                 use tracing::Instrument;
-                run.instrument(tracing::info_span!("policy.step", block.id = block.id(), block.phase = ?block.phase(), decision = tracing::field::Empty, denial.code = tracing::field::Empty)).await
+                run.instrument(tracing::info_span!("policy.step", block.id = block.id(), block.phase = ?block.phase(), decision = tracing::field::Empty, denial.code = tracing::field::Empty, lb.strategy = tracing::field::Empty, lb.backend.id = tracing::field::Empty, lb.overflow = tracing::field::Empty)).await
             };
             #[cfg(not(feature = "tracing"))]
             let result = run.await;

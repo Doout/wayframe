@@ -7,6 +7,8 @@ pub use wayframe_blocks as controls;
 pub use wayframe_core::{Block, Context, Decision, Execution, Phase, Plan, PlanError, Reason};
 #[cfg(feature = "http")]
 pub use wayframe_http as http;
+#[cfg(feature = "lb")]
+pub use wayframe_lb as lb;
 #[cfg(feature = "mcp")]
 pub use wayframe_mcp as mcp;
 pub use wayframe_runtime::{Generation, Live, Pipeline, PublishError};

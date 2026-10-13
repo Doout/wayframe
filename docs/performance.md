@@ -72,3 +72,7 @@ security review remain release qualification work.
 To measure durable user management and sampled/unsampled OTLP instrumentation, see the
 [tracing benchmark](observability.md#verify-and-measure). Exported step timings are wall time
 and include exporter/instrumentation effects; compare the same workload and sampling settings.
+
+The [load-balancing benchmark](load-balancing.md#observation-and-verification) isolates native
+selection/reservation/release across four algorithms and 2/8/64 backends. The gateway integration
+suite separately verifies real routing, affinity, and streaming lifetime; batch cost is not wire latency.

@@ -238,7 +238,7 @@ impl Store {
     pub fn open(
         config: &crate::config::Config,
         clients: Vec<(String, Identity)>,
-        upstream: Option<&str>,
+        upstream: &[String],
     ) -> Result<Arc<Self>> {
         let path = std::env::var_os("WAYFRAME_STATE_FILE").map(PathBuf::from);
         let admin = std::env::var_os("WAYFRAME_ADMIN_TOKEN")
@@ -250,7 +250,7 @@ impl Store {
         );
         let admin_hash = admin.as_deref().map(hash);
         let mut forbidden_hashes = BTreeSet::new();
-        if let Some(token) = upstream {
+        for token in upstream {
             forbidden_hashes.insert(hash(token));
         }
         if let Some(digest) = &admin_hash {

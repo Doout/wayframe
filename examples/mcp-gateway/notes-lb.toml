@@ -1,0 +1,42 @@
+listen = "127.0.0.1:8080"
+upstream = "http://127.0.0.1:9001/api/mcp"
+upstream_token_env = "WAYFRAME_UPSTREAM_TOKEN"
+
+[[clients]]
+token_env = "WAYFRAME_READER_TOKEN"
+subject = "reader"
+tenant = "notes"
+permissions = ["notes:read"]
+
+[[clients]]
+token_env = "WAYFRAME_OPERATOR_TOKEN"
+subject = "operator"
+tenant = "notes"
+permissions = ["notes:read", "notes:write", "notes:admin", "gateway:metrics"]
+
+[tools]
+get_note = "notes:read"
+put_note = "notes:write"
+delete_note = "notes:write"
+admin_preview = "notes:admin"
+
+[load_balancer]
+strategy = "weighted_round_robin"
+failure_cooldown_ms = 1000
+
+[[load_balancer.backends]]
+id = "notes-a"
+endpoint = "http://127.0.0.1:9001/api/mcp"
+weight = 1
+quota = 8
+priority = 0
+
+[[load_balancer.backends]]
+id = "notes-b"
+endpoint = "http://127.0.0.1:9002/api/mcp"
+weight = 3
+quota = 8
+priority = 1
+# Optional distinct credential and CA for this replica:
+# token_env = "WAYFRAME_BACKEND_B_TOKEN"
+# ca = "/absolute/path/to/backend-b-ca.pem"

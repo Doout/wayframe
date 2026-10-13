@@ -1,0 +1,24 @@
+[package]
+name = "wayframe-lb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+wayframe-core = { path = "../wayframe-core" }
+serde.workspace = true
+tracing = { workspace = true, optional = true }
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+
+[dev-dependencies]
+wayframe-runtime = { path = "../wayframe-runtime" }
+tokio.workspace = true
+serde_json.workspace = true

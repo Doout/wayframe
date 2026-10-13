@@ -69,3 +69,17 @@ impl wayframe_core::Context for RequestContext {
         self.deadline.into_std()
     }
 }
+
+/// Only trusted session/routing code supplies this hint; client headers cannot select an origin.
+#[cfg(feature = "lb")]
+#[derive(Clone)]
+pub struct PinnedBackend(pub String);
+#[cfg(feature = "lb")]
+impl wayframe_lb::RoutingContext for RequestContext {
+    fn pinned_backend(&self) -> Option<&str> {
+        self.extensions.get::<PinnedBackend>().map(|p| p.0.as_str())
+    }
+    fn set_selection(&mut self, selection: wayframe_lb::Selection) {
+        self.extensions.insert(selection);
+    }
+}

@@ -3391,6 +3391,7 @@ dependencies = [
  "wayframe-blocks",
  "wayframe-core",
  "wayframe-http",
+ "wayframe-lb",
  "wayframe-mcp",
  "wayframe-runtime",
  "wayframe-transport",
@@ -3460,6 +3461,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-opentelemetry",
+ "wayframe-core",
+ "wayframe-lb",
+ "wayframe-runtime",
+]
+
+[[package]]
+name = "wayframe-lb"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
  "wayframe-core",
  "wayframe-runtime",
 ]

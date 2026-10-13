@@ -12,6 +12,7 @@ use wayframe::{
 struct Session {
     owner: (String, String),
     touched: Instant,
+    backend: Option<String>,
 }
 pub struct Sessions {
     entries: Mutex<HashMap<String, Session>>,
@@ -26,7 +27,11 @@ impl Sessions {
             lifetime: Duration::from_secs(1800),
         }
     }
+    #[cfg(test)]
     pub fn bind(&self, id: &str, identity: &Identity) -> bool {
+        self.bind_backend(id, identity, None)
+    }
+    pub fn bind_backend(&self, id: &str, identity: &Identity, backend: Option<String>) -> bool {
         if id.is_empty() || id.len() > 512 || !id.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
             return false;
         }
@@ -42,6 +47,7 @@ impl Sessions {
             Session {
                 owner: (identity.tenant.clone(), identity.subject.clone()),
                 touched: Instant::now(),
+                backend,
             },
         );
         true
@@ -60,7 +66,7 @@ impl Block<RequestContext> for Sessions {
         Phase::Authorize
     }
     fn execute<'a>(&'a self, ctx: &'a mut RequestContext) -> Execution<'a> {
-        let decide = || {
+        let mut decide = || {
             let Some(identity) = &ctx.identity else {
                 return Decision::deny(Reason::Unauthenticated, "unauthorized");
             };
@@ -86,6 +92,10 @@ impl Block<RequestContext> for Sessions {
             }
             if session.owner != (identity.tenant.clone(), identity.subject.clone()) {
                 return Decision::deny(Reason::Forbidden, "session_not_owned");
+            }
+            if let Some(backend) = &session.backend {
+                ctx.extensions
+                    .insert(wayframe::http::PinnedBackend(backend.clone()));
             }
             session.touched = Instant::now();
             Decision::Continue
