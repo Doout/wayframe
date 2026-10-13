@@ -33,7 +33,7 @@ jobs:
         run: bash scripts/benchmark.sh --requests 100 --rounds 1 --concurrency 1 --payloads 64 --formats json --native-only --skip-boundaries
       - name: Upload verification reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: verification-${{ matrix.os }}
           path: |
