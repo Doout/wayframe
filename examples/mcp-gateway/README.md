@@ -20,7 +20,7 @@ Start the official-SDK notes server in one terminal:
 
 ```bash
 source .env
-python3 examples/notes-server/server.py --database target/notes.sqlite3
+python3 examples/notes-server/server.py --database var/notes.sqlite3
 ```
 
 Start the gateway in another:

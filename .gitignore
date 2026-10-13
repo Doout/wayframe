@@ -9,3 +9,4 @@
 *.log
 __pycache__/
 *.pyc
+/var/

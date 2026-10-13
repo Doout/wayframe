@@ -7,8 +7,11 @@ survives process restart. `admin_preview` reads stored record counts and payload
 ```bash
 python3 -m pip install -r requirements-dev.txt
 source .env
-python3 examples/notes-server/server.py --database target/notes.sqlite3
+python3 examples/notes-server/server.py --database var/notes.sqlite3
 ```
+
+`var/` is ignored by Git and kept outside Cargo's build outputs, so `cargo clean` does not remove
+the database. Back up that directory when retaining example data.
 
 It binds `127.0.0.1:9001`, serves `/api/mcp`, and requires `WAYFRAME_UPSTREAM_TOKEN`.
 The gateway uses a separate service credential; clients authenticate to the gateway with their own
