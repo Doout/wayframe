@@ -1,0 +1,13 @@
+/target/
+/plugins/*/target/
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+.ruff_cache/
+*.log
+__pycache__/
+*.pyc
+/verification/local/
+/benchmarks/results/

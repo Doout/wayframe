@@ -1,0 +1,14 @@
+package wayframe:gateway@0.1.0;
+
+world policy {
+    // 0 continues; 400/401/403/404/409/413/429 deny; every other value fails closed.
+    // Inputs are an operator-approved projection. No ambient host imports exist.
+    export authorize: func(
+        method: string,
+        path: string,
+        subject: string,
+        tenant: string,
+        operation: string,
+        target: string,
+    ) -> u16;
+}

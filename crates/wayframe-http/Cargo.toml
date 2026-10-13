@@ -1,0 +1,26 @@
+[package]
+name = "wayframe-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+wayframe-core = { path = "../wayframe-core" }
+wayframe-runtime = { path = "../wayframe-runtime" }
+anyhow.workspace = true
+http.workspace = true
+bytes.workspace = true
+axum.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+async-stream.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

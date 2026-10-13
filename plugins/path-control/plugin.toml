@@ -1,0 +1,13 @@
+name = "path-control"
+version = "0.1.0"
+abi = "wayframe:gateway/policy@0.1.0"
+component = "path-control.component.wat"
+sha256 = "b8e7c2df2e0f67bf23e84d4786bcd48825c3d58a32038ba1f473c4feea2fc0c8"
+# This is an OPERATOR APPROVED grant, not a guest-controlled permission request.
+capabilities = ["request.path", "operation.target"]
+warm_instances = 8
+memory_mib = 2
+fuel = 100000
+# Starting values, not measured service-level guarantees.
+timeout_ms = 10
+init_timeout_ms = 1000

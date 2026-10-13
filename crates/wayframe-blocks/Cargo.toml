@@ -1,0 +1,22 @@
+[package]
+name = "wayframe-blocks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+wayframe-core = { path = "../wayframe-core" }
+http.workspace = true
+tokio.workspace = true
+jsonwebtoken.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+
+wayframe-http = { path = "../wayframe-http" }
