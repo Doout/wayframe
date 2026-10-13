@@ -11,6 +11,16 @@ workspace = true
 
 [dependencies]
 wayframe-core = { path = "../wayframe-core" }
+wayframe-flow = { path = "../wayframe-flow", optional = true }
+wayframe-cache = { path = "../wayframe-cache", optional = true }
+wayframe-observability = { path = "../wayframe-observability", optional = true }
+wayframe-auth = { path = "../wayframe-auth", optional = true }
+wayframe-routing = { path = "../wayframe-routing", optional = true }
+wayframe-resilience = { path = "../wayframe-resilience", optional = true }
+wayframe-plugins = { path = "../wayframe-plugins", optional = true }
+wayframe-codec = { path = "../wayframe-codec", optional = true }
+wayframe-listeners = { path = "../wayframe-listeners", optional = true }
+wayframe-management = { path = "../wayframe-management", optional = true }
 wayframe-runtime = { path = "../wayframe-runtime" }
 wayframe-http = { path = "../wayframe-http", optional = true }
 wayframe-blocks = { path = "../wayframe-blocks", optional = true }
@@ -20,8 +30,21 @@ wayframe-wasm = { path = "../wayframe-wasm", optional = true }
 
 wayframe-lb = { path = "../wayframe-lb", optional = true }
 
+wayframe-policies = { path = "../wayframe-policies", optional = true }
+
 [features]
 default = []
+policies = ["dep:wayframe-policies", "plugins", "http"]
+flow = ["dep:wayframe-flow", "wayframe-http?/flow"]
+cache = ["dep:wayframe-cache"]
+observability = ["otel", "dep:wayframe-observability", "wayframe-observability/otel"]
+auth = ["http", "dep:wayframe-auth"]
+routing = ["dep:wayframe-routing", "wayframe-http?/routing"]
+resilience = ["dep:wayframe-resilience"]
+plugins = ["dep:wayframe-plugins"]
+codec = ["dep:wayframe-codec"]
+listeners = ["dep:wayframe-listeners"]
+management = ["http", "mcp", "dep:wayframe-management"]
 http = ["dep:wayframe-http"]
 lb = ["dep:wayframe-lb", "wayframe-http?/lb"]
 otel = ["http", "wayframe-http/otel"]
@@ -31,6 +54,7 @@ mcp = ["http", "dep:wayframe-mcp"]
 wasm = ["http", "dep:wayframe-wasm"]
 
 [dev-dependencies]
+http.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
@@ -44,3 +68,11 @@ required-features = ["http", "transport", "wasm"]
 [[example]]
 name = "lb_cost"
 required-features = ["lb"]
+
+[[example]]
+name = "flow_cost"
+required-features = ["flow"]
+
+[[example]]
+name = "boundary_fuzz"
+required-features = ["mcp", "codec"]

@@ -54,7 +54,8 @@ should decide whether these metadata are acceptable in their telemetry backend. 
 errors remain visible on stderr. The batch queue is bounded to 4096 spans, exporting batches of
 up to 512. Collector failure does not participate in policy decisions; sustained pressure can
 lose telemetry. Graceful shutdown flushes the provider; abrupt process termination cannot.
-This provides trace export and HTTP counters, not OTLP metrics/log export or an audit ledger.
+This exports traces and exposes HTTP metrics/histograms. Audit records use a separate durable
+local file; OTLP metrics/log export is not enabled by this adapter.
 
 The reusable runtime enables per-block tracing with its optional `tracing` feature; HTTP enables
 it. Bare typed applications can opt in without choosing an exporter. The dependency-free core
@@ -82,3 +83,21 @@ warmup, and timed calls; end-to-end latency samples exclude setup/warmup. Each r
 gateway calls. Comparing differences between separate runs estimates added tracing overhead;
 retain spread and CPU alongside latency. The local receiver itself consumes resources. See
 [performance methodology](performance.md) for measurement limits.
+
+
+## Graphs, protocol outcomes and lifecycle
+
+Graph traces include execution and node outcomes, dependency edges, dependency wait, scheduler wait,
+and execution nanoseconds. Branch spans overlap when work is parallel, while the join follows their
+completion. Cancellation closes node spans; CPU work may outlive caller timeout while retaining its
+pool slot. Source/cancellation/budget errors are distinguished, and RPC errors inside HTTP 200 plus
+gRPC error trailers mark the request as a protocol error.
+
+Metrics include bounded histograms for admitted request lifetime, preflight, body inspection, policy
+and upstream response headers, plus cache state and configured plugin instances. They are scoped to
+the active generation and restart on reload; spans include deployment generation for correlation.
+`/healthz` is liveness and `/readyz` checks required prepared resources.
+
+Audit records live separately from traces and contain redacted actor/action/object/revision/outcome.
+They never include issued credentials or request arguments. See [management](management.md) and
+[reloads](reloads.md) for persistence and retry behavior.

@@ -20,3 +20,8 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 bytes.workspace = true
+
+wayframe-codec = { path = "../wayframe-codec" }
+tracing.workspace = true
+axum = { workspace = true, features = ["ws"] }
+async-stream.workspace = true

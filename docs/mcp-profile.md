@@ -10,7 +10,7 @@ The original standard-library fixture remains useful for malformed-envelope test
 | Capability | 2026-07-28 | 2025-11-25 |
 | --- | --- | --- |
 | Lifecycle | `server/discover`, per-request metadata | `initialize`, `notifications/initialized` |
-| Methods | `ping`, `tools/list`, `tools/call` | Same plus cancellation notification |
+| Methods | Tools, configured resources/prompts, modern subscriptions, owned MRTR/tasks | Configured tools/resources/prompts and cancellation/session transport |
 | HTTP transport | POST with JSON or SSE results | POST, session GET and DELETE |
 | Sessions | Stateless requests | IDs bound to authenticated tenant/subject |
 | HTTP over Unix socket | Supported | Supported |
@@ -23,8 +23,8 @@ requests are also authorized from their body, rather than optional headers. Dupl
 ambiguous headers, excessive envelopes, invalid IDs, and mismatched targets are rejected.
 
 Authenticated identities and permissions come from operator configuration. Each tool has an
-explicit required permission; unknown tools and other operations are denied. `tools/list` exposes
-the upstream catalog, including tools the caller cannot execute. The upstream service credential
+explicit required permission; unknown tools and other operations are denied. Discovery/list results are filtered against current grants; denied/unknown tools and resources
+are removed. The upstream service credential
 is distinct from every client credential, and client authorization/identity headers are stripped
 before forwarding. A Wasm continue decision cannot override a native denial.
 
@@ -42,14 +42,21 @@ record. Ownership is local to a gateway process; clients reinitialize after gate
 - Native/guest tool denials, client/upstream credential separation, Host/Origin checks, malformed
   envelopes, request-size limits, unknown tools, and cross-identity session reuse.
 
-This qualifies the documented tools profile. Resources, prompts, elicitation, sampling, client
-responses to server requests, extensions, batch calls, resumable SSE, OAuth discovery, and general
-bidirectional server-initiated stdio requests are not implemented by this application. Upstream
-servers requiring those capabilities need additional adapters and authorization rules.
+Resources and prompts require explicit URI/name-to-permission rules. Subscriptions require an
+approved notification filter; records are checked against those selections and current grants.
+Opaque MRTR request state is hashed and bound to owner, original operation/parameters, backend and
+generation. Task IDs are bound to their creator and original permissions; unowned task access and
+task listing are denied. Ownership is bounded and process/generation-local.
 
-The listener binds loopback; public deployment requires ingress TLS and production identity,
-connection, and resource controls. See [gateway setup](../examples/mcp-gateway/README.md) and
-[security boundaries](../SECURITY.md).
+Modern input-required results pass through; the gateway does not execute client elicitation,
+sampling or roots requests itself. Legacy server-initiated stdio callbacks receive method-not-found.
+Batch envelopes, arbitrary client responses, transparent retries and resumable SSE replay remain
+outside the profile. Generic custom TCP/WebSocket bindings do not claim standard MCP conformance.
+
+The listener may use verified TLS/mTLS, and OIDC/JWKS plus protected-resource metadata are optional.
+An upstream OAuth provider uses its own client credentials/resource. It never exchanges the caller's
+token. See [transport contracts](transports.md), [reload behavior](reloads.md),
+[gateway setup](../examples/mcp-gateway/README.md) and [security boundaries](../SECURITY.md).
 
 ## References
 

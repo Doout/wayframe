@@ -1,22 +1,23 @@
-# Roadmap
+# Release qualification
 
-The alpha implements typed linear pipelines, deployment snapshots, native controls, HTTP
-forwarding, task/Unix/HTTPS policy bridges, Wasm policies, and a read-only MCP example.
+The alpha includes linear policies and typed local graphs; plugin factories and lifecycle contracts;
+persistent users/rules, scoped administration and auditing; JWKS/OIDC and upstream OAuth; route groups,
+health probes and local circuit/admission controls; TLS/mTLS and framed adapters; response transforms,
+scoped single-flight caches; generation reloads; and signed Wasm artifact loading.
 
-Release qualification still requires minimum Rust version and target support decisions,
-Rust guest build validation, and third-party MCP SDK interoperability tests. Packages retain
-`publish=false` until package names, ownership, and licensing are reviewed.
+Validation includes an independently built Rust guest component, an official Python MCP SDK fixture,
+real OTLP protobuf/JSON exports, failure/overload regressions, signature/JWT negative tests, graph
+cancellation/joins, and repeatable native/network/open-loop benchmarks. See `scripts/verify.sh` and
+`scripts/build-wasm-guest.sh` for the executable checks.
 
-Planned work:
+Remaining release work concerns deployment qualification and supported expansion points:
 
-- Production ingress and resource controls: TLS, connection admission, readiness based on required
-  resources, and fleet-wide quota semantics.
-- Reliability and performance: cancellation, overload, reload and worker-failure testing; fuzzing;
-  comparable native and Wasm benchmarks across cold, warm, depleted, and refilling states.
-- Plugin distribution: package signatures, registries, versioned host capabilities, and isolated
-  external-worker supervision.
-- Protocol support: explicit stream/frame ownership, codecs, backpressure, and graph branches.
-- MCP integration: verified SDK examples, OAuth/OIDC, protected-resource metadata, identity-aware
-  tool discovery, and redacted request/response auditing.
-- Distributed operations: configuration distribution, health checks, load balancing, circuit
-  breakers, and retries with explicit idempotency rules.
+- Decide a supported minimum Rust version and target matrix beyond the pinned tested toolchain.
+- Qualify sustained workload/capacity, certificate rotation and failure recovery on the intended deployment.
+- Add shared storage/admission providers when a fleet requires coordinated quotas or durable workflow jobs.
+- Extend conformance coverage for additional MCP extensions and legacy callback bridges as needed.
+- Add coverage-guided fuzzing and production corpus retention alongside the bounded mutation harness.
+- Review package names, ownership, licensing and publication before enabling crates.io publication.
+
+Local async workflows are not a durable distributed execution service. The core remains independent
+of those deployment choices, and packages retain `publish=false` during this qualification work.

@@ -14,7 +14,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,6 +28,15 @@ jobs:
           rustup show active-toolchain
       - name: Verify source, libraries, optional plugins, and live gateway
         run: bash scripts/verify.sh
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-tools
+          key: wasm-tools-${{ runner.os }}-1.261.0
+      - name: Build and execute Rust guest component
+        run: |
+          if ! command -v wasm-tools >/dev/null; then cargo install wasm-tools --version 1.261.0 --locked; fi
+          bash scripts/build-wasm-guest.sh
+          python3 scripts/smoke.py --wasm --plugin-manifest target/path-control/plugin.toml > target/verification/rust-guest-smoke.json
       - name: Check benchmark harness
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/benchmark.sh --requests 100 --rounds 1 --concurrency 1 --payloads 64 --formats json --native-only --skip-boundaries

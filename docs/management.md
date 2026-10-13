@@ -50,16 +50,19 @@ once; protect captured output and supply that token to the user's MCP client. `s
 credentials or digests. Disable a user by setting `enabled` to `false` in their full profile and
 running `update-user`; adjust `permissions` in the same way. Identity (`id`, `tenant`, `subject`)
 is immutable. Deletion also removes that user's rate rules. Existing admitted work can finish;
-revocation does not cancel already running upstream operations or established streams. Credentials
+revocation does not undo upstream work already dispatched. Subscription records recheck current
+grants and terminate when those grants change. Credentials
 are checked again after body collection, so rotation also rejects an old token whose request was
 admitted but has not yet reached dispatch.
 
 The sample rules preserve the four notes tool grants and add a `put_note` budget. Customize the
 entire document before applying it. Rules always add mandatory controls; they cannot override a
-permission or Wasm denial. Unknown tools and unsupported MCP operations remain denied. Discovery
-still returns the upstream catalog.
+permission or Wasm denial. Unknown tools and unsupported MCP operations remain denied. Discovery is filtered against current grants and denied-tool rules. Identity-specific catalogs
+advertise private, non-cacheable results.
 
-A rate rule's `user: null` creates an independent bucket for every user. A specific user ID narrows
+A rate rule defaults to `scope: "user"`: `user: null` creates an independent bucket for every user.
+`scope: "tenant"` aggregates the matching tenant, and `scope: "global"` shares one process-local
+bucket. An optional `tenant` selector restricts which authenticated tenant matches. A specific user ID narrows
 that rule. `tool: null` applies before body collection, including lifecycle and denied requests;
 a tool name applies after inspected tool authorization. All matching rules must have capacity.
 Rates must be positive and at most 1,000,000/sec; bursts are 1..1,000,000. Up to 128 rules and 1024
@@ -73,7 +76,10 @@ HTTP client with Unix socket support. Remote administration requires a TLS ingre
 
 ## API
 
-Every endpoint requires the separate admin bearer token. Browser Origin headers are rejected;
+Every endpoint requires a separate admin credential. The bootstrap token has the owner role.
+Additional `[[admins]]` configurations name an `id`, `token_env` and role: `reader`, `users`, `rules`,
+`deployment` or `owner`. All roles may inspect state/deployment; mutations require their matching
+scope. Credentials must differ from users and upstream services. Browser Origin headers are rejected;
 Host must match the configured listener. Responses use `Cache-Control: no-store`.
 
 | Method and path | Body / behavior |
@@ -97,3 +103,21 @@ idempotent: if its response is lost, inspect the user and rotate their token. Fi
 and the process lock fail startup rather than falling back to bootstrap state.
 
 See [tracing](observability.md) for request steps and management persistence spans.
+
+
+## Identity and audits
+
+Optional `[auth]` configuration verifies RS256 tokens against an explicit issuer, audience and
+JWKS URL. Keys refresh proactively and on bounded unknown-kid lookup. Only the configured
+`permission_map` maps trusted claims into grants. A matching local user profile further restricts
+those grants and its enabled state. Unknown federated identities receive bounded local rate state;
+clientInfo, annotations and unverified headers grant nothing.
+
+Management writes record redacted actor/action/object/revision/outcome in a private, bounded,
+exclusively locked audit file (default: the state's sibling `.audit.jsonl`). Credentials, argument
+payloads and issued tokens are excluded. Records are fsynced and checked against a digest chain on
+reopen. See [reloads](reloads.md) for audit failure/retry behavior and deployment controls.
+
+The management and session services are reusable library crates. Persistent state remains local
+and locked to one process; rate buckets and continuation ownership are not fleet-wide or durable
+workflow state. Choose a shared provider when deploying several gateway replicas.

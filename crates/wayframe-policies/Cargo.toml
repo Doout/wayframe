@@ -1,0 +1,23 @@
+[package]
+name = "wayframe-policies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+[lints]
+workspace = true
+[dependencies]
+wayframe-core = { path = "../wayframe-core" }
+wayframe-http = { path = "../wayframe-http", features=["routing"] }
+wayframe-codec = { path = "../wayframe-codec" }
+wayframe-plugins = { path = "../wayframe-plugins" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+http.workspace = true
+jsonschema = { version = "0.58", default-features = false }
+wayframe-cache = { path = "../wayframe-cache" }
+wayframe-lb = { path = "../wayframe-lb" }
+wayframe-routing = { path = "../wayframe-routing" }
+tokio.workspace = true

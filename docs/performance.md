@@ -32,6 +32,8 @@ Outputs are under ignored `target/benchmarks/`:
 | `mcp-overhead.csv` | Latency, paired added p50, throughput, gateway CPU, memory, and error counts |
 | `policy-boundaries.json` | Native, task, Unix RPC, HTTPS RPC, and Wasm invocation distributions |
 | `native-pipeline.json` | Repeated batches of 0/1/4/16/64 blocks, including the empty-plan baseline |
+| `graph-scheduling.json` | Typed graph scheduling against equivalent linear plans |
+| `native-load-balancer.json` | Selection and lease costs across backend counts and algorithms |
 
 Every timed request validates its correlated MCP result and exact persisted value/revision.
 Failures remain in the report, and the command fails when a scenario records errors. Warmup is
@@ -66,8 +68,9 @@ The native microbenchmark times batches to reduce timer overhead. It reports rep
 spread, checksum, and added nanoseconds above an empty plan. It excludes HTTP, TLS, MCP, and Wasm.
 
 Run on an otherwise idle machine and retain environment, raw samples, and configuration when
-comparing changes. Fuzzing, overload/fault tests, deployment-scale measurements, and independent
-security review remain release qualification work.
+comparing changes. The suite includes bounded mutation and overload/fault regressions;
+coverage-guided fuzzing, deployment-scale measurements and independent security review remain
+release qualification work.
 
 To measure durable user management and sampled/unsampled OTLP instrumentation, see the
 [tracing benchmark](observability.md#verify-and-measure). Exported step timings are wall time
@@ -76,3 +79,28 @@ and include exporter/instrumentation effects; compare the same workload and samp
 The [load-balancing benchmark](load-balancing.md#observation-and-verification) isolates native
 selection/reservation/release across four algorithms and 2/8/64 backends. The gateway integration
 suite separately verifies real routing, affinity, and streaming lifetime; batch cost is not wire latency.
+
+
+## Graph scheduling and offered load
+
+`flow_cost` measures seven repeated warm batches at 0/1/4/16/64 nodes, alongside equivalent linear
+no-op plans. Graph costs include owned outputs, dependency scheduling, limits and reports. They
+exclude network, SDK and real policy execution. Keep this distinction when selecting a runtime.
+
+`--arrival-rate` adds fixed offered-load measurements. Latency begins at the scheduled arrival,
+including launch delay; attempts that exceed the generator's configured in-flight bound are counted
+as generator overload, without allocating an unbounded queue. Every offered request remains in the
+attempt/error totals. Rate zero keeps the closed-loop worker model. Use separate output directories
+for moderate load, overload and repeated soak rounds, for example:
+
+```bash
+bash scripts/benchmark.sh --arrival-rate 500 --requests 5000 --rounds 3 --concurrency 32 \
+  --transports tcp --formats json --payloads 64 --native-only --skip-boundaries \
+  --output target/benchmarks/soak
+```
+
+Check RSS/CPU per process and raw failures;
+short local runs establish harness behavior, not a production capacity or leak-free soak guarantee.
+
+Reports are saved after each completed round and on failure. An all-failed timed round retains JSON
+and CSV with unavailable percentiles instead of crashing while formatting a missing number.

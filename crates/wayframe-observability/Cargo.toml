@@ -1,0 +1,29 @@
+[package]
+name = "wayframe-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+[lints]
+workspace = true
+[dependencies]
+anyhow.workspace = true
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tokio = { workspace = true, optional = true }
+fs2 = "0.4"
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+otel = ["dep:opentelemetry","dep:opentelemetry_sdk","dep:opentelemetry-otlp","dep:tracing-opentelemetry","dep:tracing","dep:tracing-subscriber","dep:tokio"]

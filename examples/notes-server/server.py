@@ -93,6 +93,18 @@ def create_server(database: Path) -> MCPServer:
 
         return await asyncio.to_thread(preview)
 
+    @server.resource("notes://summary", mime_type="application/json")
+    async def note_summary() -> str:
+        """Read stored note counts through the resources interface."""
+        import json
+
+        return json.dumps(await admin_preview())
+
+    @server.prompt()
+    def summarize_notes() -> str:
+        """Provide a reusable note summarization prompt."""
+        return "Summarize the note data supplied by the caller. Preserve facts and revisions."
+
     return server
 
 
@@ -102,6 +114,7 @@ def main() -> None:
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--path", default="/api/mcp")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--stdio", action="store_true")
     parser.add_argument("--tls-cert")
     parser.add_argument("--tls-key")
     args = parser.parse_args()
@@ -109,6 +122,9 @@ def main() -> None:
     if len(token) < 32:
         raise ValueError("upstream token must contain at least 32 characters")
     server = create_server(args.database)
+    if args.stdio:
+        server.run(transport="stdio")
+        return
     app = server.streamable_http_app(streamable_http_path=args.path, json_response=args.json)
 
     async def authenticated(scope, receive, send):

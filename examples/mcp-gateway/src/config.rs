@@ -14,7 +14,7 @@ pub struct Credentials {
     pub backend_tokens: HashMap<String, String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Client {
     pub token_env: String,
@@ -27,9 +27,25 @@ pub struct Client {
 pub struct Config {
     pub listen: SocketAddr,
     pub upstream: String,
+    pub stdio_upstream: Option<wayframe::transport::stdio::Config>,
     pub upstream_token_env: Option<String>,
+    pub upstream_oauth: Option<wayframe::auth::upstream::Config>,
     pub upstream_ca: Option<String>,
+    #[serde(default)]
+    pub upstream_http2: bool,
     pub load_balancer: Option<LoadBalancerConfig>,
+    #[serde(default)]
+    pub async_policies: Vec<AsyncPolicy>,
+    pub auth: Option<wayframe::auth::Config>,
+    #[serde(default)]
+    pub admins: Vec<AdminConfig>,
+    #[serde(default)]
+    pub routes: Vec<wayframe::routing::Route>,
+    #[serde(default)]
+    pub groups: HashMap<String, LoadBalancerConfig>,
+    pub tenant_concurrency: Option<usize>,
+    #[serde(default)]
+    pub plugins: Vec<wayframe::plugins::Config>,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
     #[serde(default)]
@@ -57,6 +73,32 @@ pub struct LoadBalancerConfig {
     pub backends: Vec<BackendConfig>,
     #[serde(default = "default_cooldown")]
     pub failure_cooldown_ms: u64,
+    pub health_path: Option<String>,
+    #[serde(default = "default_probe_interval")]
+    pub health_interval_ms: u64,
+}
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    pub id: String,
+    pub token_env: String,
+    pub role: wayframe::management::AdminRole,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncPolicy {
+    pub id: String,
+    pub url: String,
+    pub token_env: String,
+    pub ca: Option<String>,
+    #[serde(default = "policy_timeout")]
+    pub timeout_ms: u64,
+}
+fn policy_timeout() -> u64 {
+    1000
+}
+fn default_probe_interval() -> u64 {
+    5000
 }
 fn default_cooldown() -> u64 {
     1000
@@ -67,7 +109,10 @@ pub struct BackendConfig {
     pub id: String,
     pub endpoint: String,
     pub token_env: Option<String>,
+    pub oauth: Option<wayframe::auth::upstream::Config>,
     pub ca: Option<String>,
+    #[serde(default)]
+    pub http2: bool,
     #[serde(default = "default_weight")]
     pub weight: u32,
     #[serde(default)]
@@ -76,6 +121,8 @@ pub struct BackendConfig {
     pub priority: u32,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub hard_limit: u32,
 }
 fn default_weight() -> u32 {
     1
@@ -91,6 +138,7 @@ impl BackendConfig {
             quota: self.quota,
             priority: self.priority,
             enabled: self.enabled,
+            hard_limit: self.hard_limit,
         }
     }
 }
@@ -135,6 +183,12 @@ pub fn secret(name: &str) -> Result<String> {
     Ok(value)
 }
 impl Config {
+    pub fn bootstrap_fingerprint(&self) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+            &serde_json::json!({"clients":self.clients,"tools":self.tools,"admins":self.admins,"rate":self.requests_per_second,"burst":self.burst}),
+        )?)))
+    }
     pub fn load() -> Result<Self> {
         let mut config = if let Ok(path) = std::env::var("WAYFRAME_CONFIG") {
             let metadata = std::fs::metadata(&path)?;
@@ -169,10 +223,20 @@ impl Config {
             listen: std::env::var("WAYFRAME_LISTEN")
                 .unwrap_or_else(|_| "127.0.0.1:8080".into())
                 .parse()?,
+            stdio_upstream: None,
             upstream: format!("{}/mcp", origin.trim_end_matches('/')),
+            upstream_oauth: None,
             upstream_token_env: Some("WAYFRAME_UPSTREAM_TOKEN".into()),
             upstream_ca: None,
+            upstream_http2: false,
             load_balancer: None,
+            async_policies: vec![],
+            auth: None,
+            admins: vec![],
+            routes: vec![],
+            groups: HashMap::new(),
+            tenant_concurrency: None,
+            plugins: vec![],
             allowed_origins: vec![],
             allowed_hosts: vec![],
             clients: vec![
@@ -204,11 +268,13 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.listen.ip().is_loopback(),
-            "bind to loopback and use a TLS ingress for remote clients"
+            self.listen.ip().is_loopback()
+                || (std::env::var_os("WAYFRAME_TLS_CERT").is_some()
+                    && std::env::var_os("WAYFRAME_TLS_KEY").is_some()),
+            "remote listeners require a configured TLS certificate and key"
         );
         ensure!(
-            !self.clients.is_empty() && self.clients.len() <= 128,
+            (!self.clients.is_empty() || self.auth.is_some()) && self.clients.len() <= 128,
             "configure 1..128 clients"
         );
         ensure!(
@@ -228,6 +294,16 @@ impl Config {
             "invalid response limit"
         );
         ensure!((1..=120).contains(&self.timeout_seconds), "invalid timeout");
+        self.limits().validate()?;
+        ensure!(
+            self.requests_per_second.is_finite()
+                && self.requests_per_second > 0.0
+                && self.requests_per_second <= 1000000.0
+                && (1..=1000000).contains(&self.burst),
+            "invalid rate limits"
+        );
+        wayframe::mcp::ToolPermissions::new("validate".into(), self.tools.clone())
+            .map_err(anyhow::Error::msg)?;
         let mut subjects = HashSet::new();
         for client in &self.clients {
             ensure!(
@@ -251,16 +327,64 @@ impl Config {
             );
         }
         self.endpoint()?;
-        if let Some(lb) = &self.load_balancer {
+        ensure!(
+            self.stdio_upstream.is_none()
+                || (self.load_balancer.is_none() && self.groups.is_empty()),
+            "stdio upstream cannot share HTTP backend groups"
+        );
+        ensure!(
+            self.groups.len() <= 128
+                && self.admins.len() <= 64
+                && self
+                    .tenant_concurrency
+                    .is_none_or(|n| (1..=100000).contains(&n)),
+            "invalid service bounds"
+        );
+        ensure!(
+            self.routes.is_empty() == self.groups.is_empty(),
+            "routes and groups must be configured together"
+        );
+        ensure!(
+            self.groups.is_empty() || self.load_balancer.is_none(),
+            "select named groups or one load balancer"
+        );
+        if !self.routes.is_empty() {
+            let table =
+                wayframe::routing::Table::new(self.routes.clone()).map_err(anyhow::Error::msg)?;
+            ensure!(
+                table
+                    .routes()
+                    .iter()
+                    .all(|r| self.groups.contains_key(&r.group)),
+                "unknown route group"
+            );
+        }
+        let mut backend_ids = HashSet::new();
+        for lb in self.load_balancer.iter().chain(self.groups.values()) {
             lb.pool()?;
+            ensure!(
+                (100..=600000).contains(&lb.health_interval_ms),
+                "invalid health interval"
+            );
+            if let Some(path) = &lb.health_path {
+                ensure!(
+                    canonical_path(path).as_deref() == Some(path),
+                    "invalid health path"
+                );
+            }
             ensure!(
                 lb.failure_cooldown_ms <= 600_000,
                 "invalid backend cooldown"
             );
             for backend in &lb.backends {
+                ensure!(
+                    backend_ids.insert(&backend.id),
+                    "backend IDs must be globally unique"
+                );
                 endpoint(&backend.endpoint)?;
             }
         }
+        ensure!(backend_ids.len() <= 128, "too many registered backends");
         Ok(())
     }
     pub fn endpoint(&self) -> Result<(String, String)> {
@@ -291,7 +415,7 @@ impl Config {
             );
         }
         let mut backend_tokens = HashMap::new();
-        if let Some(lb) = &self.load_balancer {
+        for lb in self.load_balancer.iter().chain(self.groups.values()) {
             for backend in &lb.backends {
                 if let Some(name) = &backend.token_env {
                     let token = secret(name)?;
@@ -384,15 +508,20 @@ mod tests {
         c.load_balancer = Some(LoadBalancerConfig {
             strategy: wayframe::lb::Strategy::RoundRobin,
             failure_cooldown_ms: 1000,
+            health_path: None,
+            health_interval_ms: 5000,
             backends: vec![BackendConfig {
                 id: "a".into(),
                 endpoint: "https://example.com/mcp".into(),
                 token_env: None,
+                oauth: None,
                 ca: None,
+                http2: false,
                 weight: 1,
                 quota: 0,
                 priority: 0,
                 enabled: true,
+                hard_limit: 0,
             }],
         });
         assert!(c.validate().is_ok());

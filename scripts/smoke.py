@@ -52,6 +52,9 @@ def main():
         "--binary", type=Path, default=ROOT / "target/debug/wayframe-example-mcp-gateway"
     )
     parser.add_argument("--wasm", action="store_true")
+    parser.add_argument(
+        "--plugin-manifest", type=Path, default=ROOT / "plugins/path-control/plugin.toml"
+    )
     args = parser.parse_args()
     binary = args.binary.resolve()
     if not binary.is_file():
@@ -72,7 +75,7 @@ def main():
         RUST_LOG="warn",
     )
     if args.wasm:
-        env["WAYFRAME_PLUGIN_MANIFEST"] = str(ROOT / "plugins/path-control/plugin.toml")
+        env["WAYFRAME_PLUGIN_MANIFEST"] = str(args.plugin_manifest.resolve())
     processes = []
     with tempfile.TemporaryDirectory(prefix="wayframe-smoke-") as tmp:
         logpath = Path(tmp) / "services.log"

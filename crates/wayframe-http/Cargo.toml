@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 wayframe-core = { path = "../wayframe-core" }
+wayframe-codec = { path = "../wayframe-codec", features=["http"] }
 wayframe-runtime = { path = "../wayframe-runtime", features = ["tracing"] }
 anyhow.workspace = true
 http.workspace = true
@@ -21,6 +22,8 @@ reqwest.workspace = true
 async-stream.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
+http-body = "1"
+http-body-util = "0.1"
 
 tracing.workspace = true
 opentelemetry = { workspace = true, optional = true }
@@ -28,7 +31,16 @@ opentelemetry_sdk = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
 wayframe-lb = { path = "../wayframe-lb", optional = true }
+wayframe-routing = { path = "../wayframe-routing", optional = true }
+wayframe-flow = { path = "../wayframe-flow", optional = true }
 
 [features]
 lb = ["dep:wayframe-lb", "wayframe-lb/tracing"]
+routing = ["dep:wayframe-routing", "lb"]
+flow = ["dep:wayframe-flow"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
+
+[dev-dependencies]
+wayframe-listeners = { path = "../wayframe-listeners" }
+hyper = { version = "1", features=["client", "http2"] }
+hyper-util = { version = "0.1",features=["tokio"] }

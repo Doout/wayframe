@@ -1,0 +1,18 @@
+[package]
+name = "wayframe-resilience"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+[lints]
+workspace = true
+[dependencies]
+wayframe-core = { path = "../wayframe-core" }
+wayframe-lb = { path = "../wayframe-lb" }
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+reqwest.workspace = true
+serde.workspace = true
+futures-util.workspace = true

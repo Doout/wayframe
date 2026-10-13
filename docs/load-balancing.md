@@ -126,3 +126,19 @@ reservations afterward. It excludes network, MCP, TLS, exporter, and saturation 
 skips the native/policy microbenchmarks.
 Use the full gateway workload to measure network/application effects; native batch timing alone
 is not a capacity measurement or production latency guarantee.
+
+
+## Named groups and local resilience
+
+The reference configuration can replace one `[load_balancer]` with several `[groups.<name>]` tables
+and ordered `[[routes]]`. Each route names `id`, `group` and `path`, plus optional `prefix`, `hosts`,
+`methods`, `tenants`, `operations` and `targets`. Conditions use authenticated identity and the
+inspected MCP operation, not spoofed forwarding headers. Route order resolves overlap; an unmatched
+route denies. All backend IDs remain globally unique and destinations are fixed at preparation.
+
+`hard_limit` caps active leases on a backend even under quota-priority overflow. After passive
+cooldown, only one half-open reservation probes recovery; a stale success cannot clear a newer
+failure. `health_path`/`health_interval_ms` enable bounded active GET probes, independent of tool calls.
+Probed groups must have a healthy enabled backend before a candidate deployment is published.
+Tenant concurrency admission is separate and occurs before body collection, so an overloaded tenant
+cannot occupy a global waiting queue. These controls are process-local; tool calls are never retried.

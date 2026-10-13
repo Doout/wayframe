@@ -9,6 +9,7 @@ import csv
 import hashlib
 import importlib.metadata
 import json
+import math
 import platform
 import secrets
 import ssl
@@ -72,7 +73,7 @@ def cpu(process):
     return usage.user + usage.system
 
 
-async def measure(services, route, transport_name, size, concurrency, requests):
+async def measure(services, route, transport_name, size, concurrency, requests, arrival_rate=0):
     processes = {"upstream": psutil.Process(services.upstream_process.pid)}
     if route == "gateway" and transport_name != "stdio":
         processes["gateway"] = psutil.Process(services.gateway_process.pid)
@@ -206,8 +207,51 @@ async def measure(services, route, transport_name, size, concurrency, requests):
                         }
                     )
 
+        async def open_loop():
+            nonlocal transferred
+            pending = set()
+            origin = time.perf_counter_ns()
+
+            async def offered(identifier, scheduled):
+                nonlocal transferred
+                try:
+                    byte_count, first_byte = await call(identifier % concurrency, identifier + 1)
+                    transferred += byte_count
+                    if first_byte is not None:
+                        first_bytes.append(first_byte)
+                    latencies.append((time.perf_counter_ns() - scheduled) / 1e6)
+                except (httpx.HTTPError, ValueError, KeyError) as error:
+                    errors.append(
+                        {
+                            "request": identifier + 1,
+                            "type": type(error).__name__,
+                            "message": str(error),
+                        }
+                    )
+
+            for identifier in range(requests):
+                scheduled = origin + int(identifier * 1e9 / arrival_rate)
+                await asyncio.sleep(max(0, (scheduled - time.perf_counter_ns()) / 1e9))
+                if len(pending) >= concurrency:
+                    errors.append(
+                        {
+                            "request": identifier + 1,
+                            "type": "LoadGeneratorOverload",
+                            "message": "configured in-flight bound reached at scheduled arrival",
+                        }
+                    )
+                    continue
+                task = asyncio.create_task(offered(identifier, scheduled))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+            if pending:
+                await asyncio.gather(*pending)
+
         try:
-            await asyncio.gather(*(worker(n) for n in range(concurrency)))
+            if arrival_rate:
+                await open_loop()
+            else:
+                await asyncio.gather(*(worker(n) for n in range(concurrency)))
         finally:
             elapsed = time.perf_counter() - started
             stop.set()
@@ -218,6 +262,8 @@ async def measure(services, route, transport_name, size, concurrency, requests):
         }
         return {
             "route": route,
+            "load_model": "open_loop" if arrival_rate else "closed_loop",
+            "offered_requests_per_second": arrival_rate or None,
             "attempted": requests,
             "succeeded": len(latencies),
             "errors": errors,
@@ -232,7 +278,7 @@ async def measure(services, route, transport_name, size, concurrency, requests):
         }
 
 
-async def scenario(args, transport_name, response_format, size, concurrency, wasm):
+async def scenario(args, transport_name, response_format, size, concurrency, wasm, progress=None):
     services = Services(
         args.binary,
         wasm=wasm,
@@ -272,7 +318,13 @@ async def scenario(args, transport_name, response_format, size, concurrency, was
             observations = {}
             for route in order:
                 observations[route] = await measure(
-                    services, route, transport_name, size, concurrency, args.requests
+                    services,
+                    route,
+                    transport_name,
+                    size,
+                    concurrency,
+                    args.requests,
+                    getattr(args, "arrival_rate", 0),
                 )
             direct, gateway = observations["direct"], observations["gateway"]
             rounds.append(
@@ -284,8 +336,14 @@ async def scenario(args, transport_name, response_format, size, concurrency, was
                     else None,
                 }
             )
+            if progress:
+                progress({"rounds": rounds, "status": "measuring"})
+            direct_p50 = "unavailable" if direct["p50_ms"] is None else f"{direct['p50_ms']:.3f}ms"
+            gateway_p50 = (
+                "unavailable" if gateway["p50_ms"] is None else f"{gateway['p50_ms']:.3f}ms"
+            )
             print(
-                f"{transport_name}/{response_format} size={size} c={concurrency} wasm={wasm} round={round_number + 1}: direct={direct['p50_ms']:.3f}ms gateway={gateway['p50_ms']:.3f}ms errors={len(direct['errors']) + len(gateway['errors'])}",
+                f"{transport_name}/{response_format} size={size} c={concurrency} wasm={wasm} round={round_number + 1}: direct={direct_p50} gateway={gateway_p50} errors={len(direct['errors']) + len(gateway['errors'])}",
                 flush=True,
             )
         direct_samples = [n for round_ in rounds for n in round_["direct"]["raw_latency_ms"]]
@@ -342,6 +400,42 @@ async def scenario(args, transport_name, response_format, size, concurrency, was
                 case["trace_step_timings"] = summary
 
 
+def save_report(report, output_directory):
+    """Retain partial and failed scenarios before display or exception propagation."""
+    (output_directory / "mcp-overhead.json").write_text(json.dumps(report, indent=2))
+    with (output_directory / "mcp-overhead.csv").open("w", newline="") as output:
+        fields = [
+            "transport",
+            "response_format",
+            "value_bytes",
+            "concurrency",
+            "policy",
+            "status",
+            "execution_error",
+            "direct_p50_ms",
+            "gateway_p50_ms",
+            "gateway_p95_ms",
+            "gateway_p99_ms",
+            "median_paired_added_p50_ms",
+            "gateway_median_requests_per_second",
+            "gateway_cpu_us_per_success",
+            "gateway_sampled_peak_rss_mib",
+            "error_count",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        for s in report["scenarios"]:
+            writer.writerow(
+                {
+                    **{k: s[k] for k in fields if k in s},
+                    "direct_p50_ms": s.get("direct", {}).get("p50_ms"),
+                    "gateway_p50_ms": s.get("gateway", {}).get("p50_ms"),
+                    "gateway_p95_ms": s.get("gateway", {}).get("p95_ms"),
+                    "gateway_p99_ms": s.get("gateway", {}).get("p99_ms"),
+                }
+            )
+
+
 async def run(args):
     report = {
         "kind": "wayframe_overhead",
@@ -388,7 +482,10 @@ async def run(args):
             "connections": "persistent pooled connections; TLS verified",
             "rate_limit": "enabled at 1,000,000 requests/sec with 1,000,000 burst",
             "wasm_pool": "64 single-use instances, 100ms budget",
-            "scope": "closed-loop successful calls including network hops, client serialization/parsing, SDK server, and SQLite read; overhead is a paired path difference, not pure framework CPU cost",
+            "arrival_rate": getattr(args, "arrival_rate", 0),
+            "scope": "scheduled arrivals"
+            if getattr(args, "arrival_rate", 0)
+            else "closed-loop calls; paired path differences include network, client, SDK and SQLite costs",
             "stdio": "one sequential gateway process at concurrency 1; baseline uses the same HTTP upstream directly; wire transports differ",
             "rss": "sampled every 50ms; not OS high-water RSS",
         },
@@ -402,41 +499,44 @@ async def run(args):
                     if transport_name == "stdio" and concurrency != 1:
                         continue
                     for wasm in (False, True) if not args.native_only else (False,):
-                        report["scenarios"].append(
-                            await scenario(
-                                args, transport_name, response_format, size, concurrency, wasm
+                        pending = {
+                            "transport": transport_name,
+                            "response_format": response_format,
+                            "value_bytes": size,
+                            "concurrency": concurrency,
+                            "policy": "native+wasm" if wasm else "native",
+                            "status": "setup",
+                        }
+                        report["scenarios"].append(pending)
+
+                        def progress(fields, pending=pending):
+                            pending.update(fields)
+                            save_report(report, args.output)
+
+                        progress({})
+                        try:
+                            completed = await scenario(
+                                args,
+                                transport_name,
+                                response_format,
+                                size,
+                                concurrency,
+                                wasm,
+                                progress=progress,
                             )
-                        )
-                        (args.output / "mcp-overhead.json").write_text(json.dumps(report, indent=2))
-    with (args.output / "mcp-overhead.csv").open("w", newline="") as output:
-        fields = [
-            "transport",
-            "response_format",
-            "value_bytes",
-            "concurrency",
-            "policy",
-            "direct_p50_ms",
-            "gateway_p50_ms",
-            "gateway_p95_ms",
-            "gateway_p99_ms",
-            "median_paired_added_p50_ms",
-            "gateway_median_requests_per_second",
-            "gateway_cpu_us_per_success",
-            "gateway_sampled_peak_rss_mib",
-            "error_count",
-        ]
-        writer = csv.DictWriter(output, fieldnames=fields)
-        writer.writeheader()
-        for s in report["scenarios"]:
-            writer.writerow(
-                {
-                    **{k: s[k] for k in fields if k in s},
-                    "direct_p50_ms": s["direct"]["p50_ms"],
-                    "gateway_p50_ms": s["gateway"]["p50_ms"],
-                    "gateway_p95_ms": s["gateway"]["p95_ms"],
-                    "gateway_p99_ms": s["gateway"]["p99_ms"],
-                }
-            )
+                        except Exception as error:
+                            progress(
+                                {
+                                    "status": "failed",
+                                    "execution_error": {
+                                        "type": type(error).__name__,
+                                        "message": str(error)[:2048],
+                                    },
+                                }
+                            )
+                            raise
+                        progress({**completed, "status": "complete"})
+    save_report(report, args.output)
     if not args.skip_boundaries:
         services = Services(args.binary, tls=True, benchmark=True)
         try:
@@ -462,6 +562,7 @@ async def run(args):
         for example, filename in [
             ("pipeline_cost", "native-pipeline.json"),
             ("lb_cost", "native-load-balancer.json"),
+            ("flow_cost", "graph-scheduling.json"),
         ]:
             micro = await asyncio.to_thread(
                 subprocess.run,
@@ -486,6 +587,12 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "target/benchmarks")
     parser.add_argument("--requests", type=int, default=1000)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument(
+        "--arrival-rate",
+        type=float,
+        default=0,
+        help="fixed offered rate; zero uses closed-loop workers",
+    )
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 16])
     parser.add_argument("--payloads", type=int, nargs="+", default=[64, 4096])
     parser.add_argument("--transports", default="tcp,unix,https,stdio")
@@ -498,7 +605,9 @@ def main():
     parser.add_argument("--policy-runs", type=int, default=2000)
     args = parser.parse_args()
     if (
-        not 0 <= args.trace_sample_ratio <= 1
+        not 0 <= args.arrival_rate <= 100000
+        or not math.isfinite(args.arrival_rate)
+        or not 0 <= args.trace_sample_ratio <= 1
         or not 100 <= args.requests <= 100000
         or not 1 <= args.rounds <= 20
         or any(c < 1 or c > 128 for c in args.concurrency)
@@ -509,6 +618,8 @@ def main():
         args.formats.split(",")
     ) <= {"json", "sse"}:
         parser.error("unknown transport or response format")
+    if args.arrival_rate and "stdio" in args.transports.split(","):
+        parser.error("open-loop measurements require an HTTP, Unix or HTTPS route")
     args.binary = args.binary.resolve()
     asyncio.run(run(args))
 

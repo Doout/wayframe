@@ -9,6 +9,11 @@ pub struct Identity {
     pub tenant: String,
     pub permissions: BTreeSet<String>,
 }
+/// Populated only by a trusted cryptographic authenticator; never sourced from request headers.
+#[derive(Clone)]
+pub struct VerifiedIssuer(pub String);
+#[derive(Clone)]
+pub struct DeploymentGeneration(pub u64);
 impl Identity {
     pub fn new(subject: impl Into<String>, tenant: impl Into<String>) -> Self {
         Self {
@@ -81,5 +86,24 @@ impl wayframe_lb::RoutingContext for RequestContext {
     }
     fn set_selection(&mut self, selection: wayframe_lb::Selection) {
         self.extensions.insert(selection);
+    }
+}
+#[cfg(feature = "routing")]
+impl wayframe_routing::RouteContext for RequestContext {
+    fn route_input(&self) -> wayframe_routing::Input<'_> {
+        wayframe_routing::Input {
+            host: self.headers.get("host").and_then(|v| v.to_str().ok()),
+            method: self.method.as_str(),
+            path: &self.path,
+            tenant: self.identity.as_ref().map(|i| i.tenant.as_str()),
+            operation: self.operation.as_ref().map(|o| o.action.as_str()),
+            target: self.operation.as_ref().and_then(|o| o.target.as_deref()),
+        }
+    }
+    fn set_route(&mut self, route: wayframe_routing::Selected) {
+        self.extensions.insert(route);
+    }
+    fn selected_route(&self) -> Option<&wayframe_routing::Selected> {
+        self.extensions.get()
     }
 }

@@ -2,12 +2,8 @@
 //! Versioned against 2026-07-28 with opt-in 2025-11-25 compatibility.
 //! The bounded JSON body is authoritative; mirrored headers are never trusted alone.
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde::{
-    de::{self, MapAccess, SeqAccess, Visitor},
-    Deserialize, Deserializer,
-};
 use serde_json::Value;
-use std::{collections::HashMap, fmt};
+use std::collections::HashMap;
 use wayframe_core::{Block, Decision, Execution, Phase, Reason};
 use wayframe_http::{Operation, RequestContext};
 
@@ -16,82 +12,7 @@ pub const LEGACY_VERSION: &str = "2025-11-25";
 const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 const META_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
 
-/// serde_json normally keeps the last duplicate key. Policy and execution parsers
-/// must never disagree on duplicate `method`, `name` or authorization metadata.
-struct UniqueValue(Value);
-impl<'de> Deserialize<'de> for UniqueValue {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Unique;
-        impl<'de> Visitor<'de> for Unique {
-            type Value = UniqueValue;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("JSON without duplicate keys")
-            }
-            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::Bool(v)))
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(UniqueValue(v.into()))
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(UniqueValue(v.into()))
-            }
-            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-                serde_json::Number::from_f64(v)
-                    .map(|n| UniqueValue(Value::Number(n)))
-                    .ok_or_else(|| E::custom("non-finite number"))
-            }
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::String(v.into())))
-            }
-            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::String(v)))
-            }
-            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::Null))
-            }
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::Null))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(v) = a.next_element::<UniqueValue>()? {
-                    values.push(v.0);
-                }
-                Ok(UniqueValue(Value::Array(values)))
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
-                let mut values = serde_json::Map::new();
-                while let Some((k, v)) = a.next_entry::<String, UniqueValue>()? {
-                    if values.insert(k, v.0).is_some() {
-                        return Err(de::Error::custom("duplicate JSON key"));
-                    }
-                }
-                Ok(UniqueValue(Value::Object(values)))
-            }
-        }
-        d.deserialize_any(Unique)
-    }
-}
-pub fn parse_unique(bytes: &[u8]) -> Result<Value, serde_json::Error> {
-    let value = serde_json::from_slice::<UniqueValue>(bytes)?.0;
-    let mut stack = vec![(&value, 0usize)];
-    let mut nodes = 0usize;
-    while let Some((node, depth)) = stack.pop() {
-        nodes += 1;
-        if depth > 64 || nodes > 4096 {
-            return Err(<serde_json::Error as de::Error>::custom(
-                "JSON complexity limit",
-            ));
-        }
-        match node {
-            Value::Array(values) => stack.extend(values.iter().map(|v| (v, depth + 1))),
-            Value::Object(values) => stack.extend(values.values().map(|v| (v, depth + 1))),
-            _ => {}
-        }
-    }
-    Ok(value)
-}
+pub use wayframe_codec::parse_unique;
 fn bad(code: &'static str) -> Decision {
     Decision::deny(Reason::InvalidInput, code)
 }
@@ -333,11 +254,26 @@ impl McpGuard {
         }
         let target = match method {
             "tools/call" | "prompts/get" => params.get("name").and_then(Value::as_str),
-            "resources/read" => params.get("uri").and_then(Value::as_str),
+            "resources/read" | "resources/subscribe" | "resources/unsubscribe" => {
+                params.get("uri").and_then(Value::as_str)
+            }
+            "tasks/get" | "tasks/update" | "tasks/cancel" | "tasks/result" => {
+                params.get("taskId").and_then(Value::as_str)
+            }
             _ => None,
         };
-        if matches!(method, "tools/call" | "prompts/get" | "resources/read")
-            && !target.is_some_and(|s| !s.is_empty() && s.len() <= 1024)
+        if matches!(
+            method,
+            "tools/call"
+                | "prompts/get"
+                | "resources/read"
+                | "resources/subscribe"
+                | "resources/unsubscribe"
+                | "tasks/get"
+                | "tasks/update"
+                | "tasks/cancel"
+                | "tasks/result"
+        ) && !target.is_some_and(|s| !s.is_empty() && s.len() <= 1024)
         {
             return bad("mcp_invalid_target");
         }
@@ -349,7 +285,12 @@ impl McpGuard {
                 Ok(v) => v,
                 Err(_) => return bad("mcp_header_mismatch"),
             };
-            match (target, mirrored) {
+            let mirrored_target = if method.starts_with("tasks/") {
+                None
+            } else {
+                target
+            };
+            match (mirrored_target, mirrored) {
                 (Some(expected), Some(actual))
                     if header_name(actual).as_deref() == Some(expected) => {}
                 (None, None) => {}
@@ -380,8 +321,37 @@ impl Block<RequestContext> for McpGuard {
 pub struct ToolPermissions {
     id: String,
     required: HashMap<String, String>,
+    resources: HashMap<String, String>,
+    prompts: HashMap<String, String>,
+    tasks: Option<String>,
 }
 impl ToolPermissions {
+    pub fn with_catalogs(
+        mut self,
+        resources: HashMap<String, String>,
+        prompts: HashMap<String, String>,
+        tasks: Option<String>,
+    ) -> Result<Self, String> {
+        for map in [&resources, &prompts] {
+            if map.len() > 1024
+                || map
+                    .iter()
+                    .any(|(k, v)| k.is_empty() || k.len() > 1024 || v.is_empty() || v.len() > 256)
+            {
+                return Err("invalid catalog permissions".into());
+            }
+        }
+        if tasks
+            .as_ref()
+            .is_some_and(|p| p.is_empty() || p.len() > 256)
+        {
+            return Err("invalid task permission".into());
+        }
+        self.resources = resources;
+        self.prompts = prompts;
+        self.tasks = tasks;
+        Ok(self)
+    }
     pub fn new(id: String, required: HashMap<String, String>) -> Result<Self, String> {
         if required.is_empty()
             || required.len() > 1024
@@ -391,7 +361,13 @@ impl ToolPermissions {
         {
             return Err("invalid tool permission map".into());
         }
-        Ok(Self { id, required })
+        Ok(Self {
+            id,
+            required,
+            resources: HashMap::new(),
+            prompts: HashMap::new(),
+            tasks: None,
+        })
     }
 }
 impl Block<RequestContext> for ToolPermissions {
@@ -403,6 +379,23 @@ impl Block<RequestContext> for ToolPermissions {
     }
     fn execute<'a>(&'a self, ctx: &'a mut RequestContext) -> Execution<'a> {
         let denied = || Decision::deny(Reason::Forbidden, "tool_not_permitted");
+        if ctx.operation.as_ref().is_some_and(|o| {
+            matches!(
+                o.action.as_str(),
+                "tools/call" | "resources/read" | "prompts/get"
+            )
+        }) {
+            let task_declared=ctx.body.as_ref().and_then(|b|parse_unique(b).ok()).is_some_and(|v|v.pointer("/params/task").is_some()||v.pointer("/params/_meta/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1tasks").is_some());
+            if task_declared
+                && !self.tasks.as_ref().is_some_and(|p| {
+                    ctx.identity
+                        .as_ref()
+                        .is_some_and(|i| i.permissions.contains(p))
+                })
+            {
+                return Execution::Immediate(denied());
+            }
+        }
         let decision = match (&ctx.identity, &ctx.operation) {
             (None, _) => Decision::deny(Reason::Unauthenticated, "unauthorized"),
             (_, None) => bad("mcp_not_inspected"),
@@ -421,6 +414,112 @@ impl Block<RequestContext> for ToolPermissions {
                     }
                     _ => denied(),
                 },
+                "resources/read" | "resources/subscribe" | "resources/unsubscribe" => {
+                    if op
+                        .target
+                        .as_ref()
+                        .and_then(|t| self.resources.get(t))
+                        .is_some_and(|p| identity.permissions.contains(p))
+                    {
+                        Decision::Continue
+                    } else {
+                        denied()
+                    }
+                }
+                "prompts/get" => {
+                    if op
+                        .target
+                        .as_ref()
+                        .and_then(|t| self.prompts.get(t))
+                        .is_some_and(|p| identity.permissions.contains(p))
+                    {
+                        Decision::Continue
+                    } else {
+                        denied()
+                    }
+                }
+                "resources/list" => {
+                    if self
+                        .resources
+                        .values()
+                        .any(|p| identity.permissions.contains(p))
+                    {
+                        Decision::Continue
+                    } else {
+                        denied()
+                    }
+                }
+                "prompts/list" => {
+                    if self
+                        .prompts
+                        .values()
+                        .any(|p| identity.permissions.contains(p))
+                    {
+                        Decision::Continue
+                    } else {
+                        denied()
+                    }
+                }
+                "tasks/get" | "tasks/update" | "tasks/cancel" | "tasks/result" => {
+                    if self
+                        .tasks
+                        .as_ref()
+                        .is_some_and(|p| identity.permissions.contains(p))
+                    {
+                        Decision::Continue
+                    } else {
+                        denied()
+                    }
+                }
+                "subscriptions/listen" => {
+                    let value = ctx.body.as_ref().and_then(|b| parse_unique(b).ok());
+                    let filter = value
+                        .as_ref()
+                        .and_then(|v| v.pointer("/params/notifications"))
+                        .and_then(Value::as_object);
+                    if filter.is_some_and(|filter| {
+                        !filter.is_empty()
+                            && filter.iter().all(|(k, v)| match k.as_str() {
+                                "toolsListChanged" => {
+                                    v.as_bool() == Some(false)
+                                        || (v.as_bool() == Some(true)
+                                            && self
+                                                .required
+                                                .values()
+                                                .any(|p| identity.permissions.contains(p)))
+                                }
+                                "promptsListChanged" => {
+                                    v.as_bool() == Some(false)
+                                        || (v.as_bool() == Some(true)
+                                            && self
+                                                .prompts
+                                                .values()
+                                                .any(|p| identity.permissions.contains(p)))
+                                }
+                                "resourcesListChanged" => {
+                                    v.as_bool() == Some(false)
+                                        || (v.as_bool() == Some(true)
+                                            && self
+                                                .resources
+                                                .values()
+                                                .any(|p| identity.permissions.contains(p)))
+                                }
+                                "resourceSubscriptions" => v.as_array().is_some_and(|values| {
+                                    values.len() <= 128
+                                        && values.iter().all(|v| {
+                                            v.as_str()
+                                                .and_then(|uri| self.resources.get(uri))
+                                                .is_some_and(|p| identity.permissions.contains(p))
+                                        })
+                                }),
+                                _ => false,
+                            })
+                    }) {
+                        Decision::Continue
+                    } else {
+                        denied()
+                    }
+                }
                 _ => denied(),
             },
             _ => denied(),

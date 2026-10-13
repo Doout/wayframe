@@ -6,12 +6,15 @@ pub struct Upstream {
     pub id: String,
     pub endpoint: String,
     pub bearer: Option<String>,
+    pub provider: Option<std::sync::Arc<dyn crate::credentials::Provider>>,
     pub ca: Option<Vec<u8>>,
+    pub http2_prior_knowledge: bool,
 }
 pub(crate) struct Prepared {
     pub endpoint: reqwest::Url,
     pub client: reqwest::Client,
     pub bearer: Option<String>,
+    pub provider: Option<std::sync::Arc<dyn crate::credentials::Provider>>,
 }
 impl Upstream {
     pub fn new(id: impl Into<String>, endpoint: impl Into<String>) -> Self {
@@ -19,7 +22,9 @@ impl Upstream {
             id: id.into(),
             endpoint: endpoint.into(),
             bearer: None,
+            provider: None,
             ca: None,
+            http2_prior_knowledge: false,
         }
     }
     pub(crate) fn prepare(self) -> Result<(String, Prepared)> {
@@ -56,6 +61,9 @@ impl Upstream {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(3))
             .pool_max_idle_per_host(32);
+        if self.http2_prior_knowledge {
+            client = client.http2_prior_knowledge();
+        }
         if let Some(ca) = self.ca {
             ensure!(ca.len() <= 64 * 1024, "backend CA too large");
             client = client.add_root_certificate(reqwest::Certificate::from_pem(&ca)?);
@@ -66,6 +74,7 @@ impl Upstream {
                 endpoint,
                 client: client.build()?,
                 bearer: self.bearer,
+                provider: self.provider,
             },
         ))
     }

@@ -1,0 +1,25 @@
+[package]
+name = "wayframe-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+[lints]
+workspace = true
+[dependencies]
+wayframe-core = { path = "../wayframe-core" }
+wayframe-http = { path = "../wayframe-http" }
+anyhow.workspace = true
+jsonwebtoken.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+base64.workspace = true
+wayframe-codec = { path = "../wayframe-codec" }
+[dev-dependencies]
+axum.workspace = true
+rsa = { version = "0.9", features = ["pem"] }
+rand08 = { package = "rand", version = "0.8" }
