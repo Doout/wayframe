@@ -216,6 +216,7 @@ struct Topology {
     guarded: Vec<Vec<usize>>,
     gates: Vec<usize>,
     scores: Vec<u64>,
+    has_budgets: bool,
 }
 pub struct Builder<C> {
     scope: Arc<()>,
@@ -669,6 +670,7 @@ impl<C: Context + Sync> Builder<C> {
             guarded: vec![vec![]; self.nodes.len()],
             gates: vec![],
             scores: vec![],
+            has_budgets: self.nodes.iter().any(|node| node.budget.is_some()),
         };
         for (i, node) in self.nodes.iter().enumerate() {
             for dependency in &node.deps {
@@ -844,6 +846,11 @@ impl<C: Context + Sync> Flow<C> {
                     return Err(Error::Deadline);
                 }
                 while tasks.len() < self.limits.max_parallel {
+                    if self.topology.has_budgets
+                        && schedule.expire_ready(&self.nodes, &mut reports, start)
+                    {
+                        return Err(Error::Deadline);
+                    }
                     let Some(i) = schedule.next(self.priority, scores, &self.nodes, deadline)
                     else {
                         break;
@@ -927,13 +934,22 @@ impl<C: Context + Sync> Flow<C> {
                     return Err(Error::InvalidGraph("unreachable_nodes"));
                 }
                 // A ready node's budget must expire even while a sibling occupies the last slot.
-                let waiting_deadline = schedule
-                    .ready
-                    .iter()
-                    .filter_map(|i| Some(schedule.ready_at[i]? + self.nodes[i].budget?))
-                    .min()
-                    .unwrap_or(deadline)
-                    .min(deadline);
+                let waiting_deadline = if self.topology.has_budgets {
+                    // timeout_at polls its future before checking the timer. Reject a known
+                    // expiration before polling work that could otherwise have side effects.
+                    if schedule.expire_ready(&self.nodes, &mut reports, start) {
+                        return Err(Error::Deadline);
+                    }
+                    schedule
+                        .ready
+                        .iter()
+                        .filter_map(|i| Some(schedule.ready_at[i]? + self.nodes[i].budget?))
+                        .min()
+                        .unwrap_or(deadline)
+                        .min(deadline)
+                } else {
+                    deadline
+                };
                 match timeout_at(waiting_deadline, tasks.next()).await {
                     Ok(Some(completed)) => {
                         accept(
@@ -948,20 +964,8 @@ impl<C: Context + Sync> Flow<C> {
                     }
                     Ok(None) => {}
                     Err(_) => {
-                        for (i, node) in self.nodes.iter().enumerate() {
-                            if reports[i].state == State::Pending
-                                && schedule.ready_at[i].is_some_and(|ready| {
-                                    node.budget
-                                        .is_some_and(|budget| ready + budget <= Instant::now())
-                                })
-                            {
-                                reports[i].state = State::Failed;
-                                reports[i].scheduler_wait =
-                                    schedule.ready_at[i].expect("ready").elapsed();
-                                tracing::warn!(node.id = %node.id, node.outcome = "timed_out",
-                                    node.scheduler_wait_ns = reports[i].scheduler_wait.as_nanos().min(u64::MAX as u128) as u64,
-                                    "workflow scheduler budget expired");
-                            }
+                        if self.topology.has_budgets {
+                            schedule.expire_ready(&self.nodes, &mut reports, start);
                         }
                         return Err(Error::Deadline);
                     }

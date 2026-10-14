@@ -15,8 +15,6 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    env:
-      RUSTUP_HOME: ${{ runner.temp }}/wayframe-rustup
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,6 +25,8 @@ jobs:
         run: python3 -m pip install -r requirements-dev.txt
       - name: Install Rust toolchain components
         run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/wayframe-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
           rustup show active-toolchain
       - name: Verify source, libraries, optional plugins, and live gateway
         run: bash scripts/verify.sh

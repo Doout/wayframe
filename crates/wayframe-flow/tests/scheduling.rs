@@ -133,6 +133,36 @@ async fn late_sync_output_is_rejected_before_dispatch() {
 }
 
 #[tokio::test]
+async fn an_expired_ready_budget_stops_an_unpolled_dispatch_after_sync_work() {
+    let mut b = Builder::<Work>::new().limits(Limits {
+        max_parallel: 1,
+        max_executions: 1,
+        max_running_nodes: 1,
+    });
+    let root = b.input();
+    let slow = b
+        .sync("slow", Phase::Inspect, &root, |_| {
+            std::thread::sleep(Duration::from_millis(40));
+            Ok(())
+        })
+        .unwrap();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let written = writes.clone();
+    b.dispatch("dispatch", &slow, move |_| {
+        written.fetch_add(1, Ordering::SeqCst);
+        async { Ok(()) }
+    })
+    .unwrap();
+    let urgent = b.sync("urgent", Phase::Inspect, &root, |_| Ok(())).unwrap();
+    b.budget(&urgent, Duration::from_millis(20)).unwrap();
+    let failure = b.compile().unwrap().run(work(false)).await.unwrap_err();
+    assert_eq!(failure.error, Error::Deadline);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    assert_eq!(failure.nodes[3].state, State::Failed);
+    assert_eq!(failure.nodes[3].elapsed, Duration::ZERO);
+}
+
+#[tokio::test]
 async fn immediate_work_waits_for_global_capacity_without_invoking_its_action() {
     let mut b = Builder::<Work>::new().limits(Limits {
         max_parallel: 2,

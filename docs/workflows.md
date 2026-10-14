@@ -100,6 +100,8 @@ parallel scheduling. A join can therefore return directly to synchronous work wi
 executor future for each step. `NodeReport::scheduling` and OTLP `node.scheduling` identify `Inline`,
 `Serial` or `Parallel`. All modes enforce the same node/global limits, deadlines and mandatory gates.
 Late synchronous results are rejected before any dependent work can start.
+Expired ready-node budgets also stop execution before queued async work is polled, including after
+a synchronous sibling blocks the executor. These nodes report queue time and zero execution time.
 
 ## Prepared output plans
 

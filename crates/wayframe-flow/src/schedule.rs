@@ -128,6 +128,32 @@ impl Schedule {
         self.ready.remove(selected);
         Some(selected)
     }
+    pub(super) fn expire_ready(
+        &self,
+        nodes: &[Node],
+        reports: &mut [NodeReport],
+        start: Instant,
+    ) -> bool {
+        let now = Instant::now();
+        let mut expired = false;
+        for i in self.ready.iter() {
+            let ready = self.ready_at[i].expect("ready node");
+            if nodes[i].budget.is_some_and(|budget| ready + budget <= now) {
+                expired = true;
+                reports[i].state = State::Failed;
+                reports[i].dependency_wait = ready.duration_since(start);
+                reports[i].scheduler_wait = now.duration_since(ready);
+                let span = tracing::info_span!("workflow.node", node.id = %nodes[i].id,
+                    node.phase = ?nodes[i].phase, node.dependencies = %nodes[i].dependencies,
+                    node.outcome = "timed_out",
+                    node.dependency_wait_ns = reports[i].dependency_wait.as_nanos().min(u64::MAX as u128) as u64,
+                    node.scheduler_wait_ns = reports[i].scheduler_wait.as_nanos().min(u64::MAX as u128) as u64,
+                    node.execution_ns = 0u64);
+                drop(span);
+            }
+        }
+        expired
+    }
     pub(super) fn skip(
         &mut self,
         i: usize,
