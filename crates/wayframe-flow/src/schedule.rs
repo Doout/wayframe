@@ -1,4 +1,6 @@
-use super::{Action, Completed, Error, Kind, Node, NodeReport, SkipReason, State, Topology, Value};
+use super::{
+    Action, Completed, Error, Kind, Node, NodeReport, Priority, SkipReason, State, Topology, Value,
+};
 use futures_util::FutureExt;
 use std::{collections::VecDeque, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 use tokio::{
@@ -9,6 +11,8 @@ use wayframe_core::{Reason, Task};
 pub(super) struct NodeTimer {
     pub(super) span: tracing::Span,
     pub(super) done: bool,
+    pub(super) ready: Instant,
+    pub(super) started: Option<Instant>,
 }
 /// The graph has at most 257 nodes, including input. Lowest-index scheduling remains deterministic.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -84,9 +88,10 @@ pub(super) struct Schedule {
     pub(super) pending: usize,
     pub(super) branch_checks: usize,
     pub(super) pruned: usize,
+    measured: bool,
 }
 impl Schedule {
-    pub(super) fn new(nodes: &[Node]) -> Self {
+    pub(super) fn new(nodes: &[Node], measured: bool) -> Self {
         Self {
             remaining: nodes.iter().map(|node| node.deps.len()).collect(),
             ready: NodeSet::default(),
@@ -95,7 +100,33 @@ impl Schedule {
             pending: nodes.len() - 1,
             branch_checks: 0,
             pruned: 0,
+            measured,
         }
+    }
+    pub(super) fn next(
+        &mut self,
+        priority: Priority,
+        scores: &[u64],
+        nodes: &[Node],
+        deadline: Instant,
+    ) -> Option<usize> {
+        if priority == Priority::Stable {
+            return self.ready.pop_first();
+        }
+        let due = |i: usize| {
+            nodes[i].budget.map_or(deadline, |budget| {
+                deadline.min(self.ready_at[i].expect("ready") + budget)
+            })
+        };
+        let selected = self.ready.iter().min_by(|a, b| {
+            (nodes[*b].kind == Kind::Gate)
+                .cmp(&(nodes[*a].kind == Kind::Gate))
+                .then_with(|| due(*a).cmp(&due(*b)))
+                .then_with(|| scores[*b].cmp(&scores[*a]))
+                .then_with(|| a.cmp(b))
+        })?;
+        self.ready.remove(selected);
+        Some(selected)
     }
     pub(super) fn skip(
         &mut self,
@@ -189,6 +220,23 @@ impl Drop for NodeTimer {
     fn drop(&mut self) {
         if !self.done {
             self.span.record("node.outcome", "cancelled");
+            self.span.record(
+                "node.scheduler_wait_ns",
+                self.started
+                    .map_or_else(
+                        || self.ready.elapsed(),
+                        |started| started.duration_since(self.ready),
+                    )
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64,
+            );
+            self.span.record(
+                "node.execution_ns",
+                self.started
+                    .map_or(Duration::ZERO, |started| started.elapsed())
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64,
+            );
         }
     }
 }
@@ -231,12 +279,13 @@ impl Step {
         self.timer.done = true;
         (self.index, scheduler_wait, elapsed, value)
     }
-    pub(super) fn inline(self, _permit: tokio::sync::OwnedSemaphorePermit) -> Completed {
+    pub(super) fn inline(mut self, _permit: tokio::sync::OwnedSemaphorePermit) -> Completed {
         let mut started = None;
         let value = if Instant::now() >= self.end {
             Err(Error::Deadline)
         } else {
             started = Some(Instant::now());
+            self.timer.started = started;
             std::panic::catch_unwind(AssertUnwindSafe(|| {
                 match (self.action.invoke)(self.args.as_slice()) {
                     Task::Immediate(value) => value,
@@ -247,7 +296,7 @@ impl Step {
         };
         self.finish(started, value)
     }
-    pub(super) async fn run(self) -> Completed {
+    pub(super) async fn run(mut self) -> Completed {
         let mut started = None;
         let execute = async {
             let _permit = self
@@ -260,6 +309,7 @@ impl Step {
                 return Err(Error::Deadline);
             }
             started = Some(Instant::now());
+            self.timer.started = started;
             (self.action.invoke)(self.args.as_slice()).resolve().await
         };
         let value = match timeout_at(self.end, AssertUnwindSafe(execute).catch_unwind()).await {
@@ -284,6 +334,9 @@ pub(super) fn accept(
     reports[i].elapsed = elapsed;
     match value {
         Ok(value) => {
+            if schedule.measured {
+                nodes[i].observed.record(elapsed);
+            }
             values[i] = Some(value);
             reports[i].state = State::Succeeded;
             schedule.complete(i, nodes, topology, values, reports, start)

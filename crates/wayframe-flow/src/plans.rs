@@ -23,6 +23,7 @@ impl<T> Port<T> {
 pub struct Prepared {
     pub(super) scope: Arc<()>,
     pub(super) active: NodeSet,
+    pub(super) scores: Arc<[u64]>,
     total: usize,
 }
 impl Prepared {
@@ -47,7 +48,7 @@ pub struct CacheStatistics {
 }
 #[derive(Default)]
 pub(super) struct Cache {
-    entries: HashMap<NodeSet, NodeSet>,
+    entries: HashMap<NodeSet, (NodeSet, Arc<[u64]>)>,
     recent: VecDeque<NodeSet>,
     hits: u64,
     misses: u64,
@@ -68,7 +69,7 @@ impl<C: Context + Sync> Flow<C> {
             key.insert(output.index);
         }
         let mut cache = self.plan_cache.lock().unwrap_or_else(|p| p.into_inner());
-        let active = if let Some(active) = cache.entries.get(&key).copied() {
+        let (active, scores) = if let Some(active) = cache.entries.get(&key).cloned() {
             cache.hits = cache.hits.saturating_add(1);
             cache.recent.retain(|old| *old != key);
             cache.recent.push_back(key);
@@ -108,13 +109,16 @@ impl<C: Context + Sync> Flow<C> {
                 }
                 cache.evictions = cache.evictions.saturating_add(1);
             }
-            cache.entries.insert(key, active);
+            let scores: Arc<[u64]> =
+                super::priority::scores(&self.nodes, &self.topology, Some(active), false).into();
+            cache.entries.insert(key, (active, scores.clone()));
             cache.recent.push_back(key);
-            active
+            (active, scores)
         };
         Ok(Prepared {
             scope: self.scope.clone(),
             active,
+            scores,
             total: self.nodes.len(),
         })
     }

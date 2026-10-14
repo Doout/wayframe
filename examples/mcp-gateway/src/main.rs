@@ -223,6 +223,12 @@ async fn metrics(State(app): State<App>, request: Request<Body>) -> Response {
     if let Some(adaptive) = &deployment.value.adaptive {
         let statistics = adaptive.statistics();
         snapshot["adaptive"] = serde_json::json!({"linear_selections":statistics.linear,"graph_selections":statistics.graph});
+        if let Some(profile) = adaptive.profile_statistics() {
+            snapshot["adaptive"]["profile"] = serde_json::json!({"classes":profile.classes,"capacity":profile.capacity,
+                "warmups":profile.warmups,"explorations":profile.explorations,"measured_selections":profile.measured,
+                "budget_skips":profile.budget_skips,"evictions":profile.evictions,"stale_observations":profile.stale_observations,
+                "successes":profile.successes,"failures":profile.failures});
+        }
     }
     Json(snapshot).into_response()
 }

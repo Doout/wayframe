@@ -217,7 +217,13 @@ pub(crate) async fn prepare_deployment(
             config.async_policies.len() <= 16,
             "too many external policies"
         );
-        let mut graph = wayframe::flow::Builder::<RequestContext>::new();
+        let mut graph = wayframe::flow::Builder::<RequestContext>::new()
+            .priority(config.async_priority.priority())
+            .limits(wayframe::flow::Limits {
+                max_parallel: config.async_max_parallel,
+                max_executions: 128,
+                max_running_nodes: 256,
+            });
         let root = graph.input();
         let mut gates = Vec::new();
         let mut checks = Vec::new();
@@ -264,6 +270,10 @@ pub(crate) async fn prepare_deployment(
                     async move { Ok(matched.external.decide(&ctx).await) }
                 })?;
             graph.when(&call, &applies, true)?;
+            graph.cost_hint(
+                &call,
+                std::time::Duration::from_millis(control.estimated_ms),
+            )?;
             let inactive = graph.sync(
                 format!("policy-{index}-inactive"),
                 Phase::Authorize,
@@ -317,7 +327,8 @@ pub(crate) async fn prepare_deployment(
             .with_plan(prepared)?,
         );
         let threshold = config.async_parallel_threshold;
-        let selected = Arc::new(wayframe::adaptive::Adaptive::new(
+        let classifier = checks.clone();
+        let selected = wayframe::adaptive::Adaptive::new(
             "adaptive-policies",
             Phase::Authorize,
             linear,
@@ -328,7 +339,27 @@ pub(crate) async fn prepare_deployment(
                     threshold,
                 )
             },
-        )?);
+        )?;
+        let selected = if let Some(profile) = &config.async_profile {
+            selected.with_profile(
+                move |ctx: &RequestContext| {
+                    let key = classifier
+                        .iter()
+                        .enumerate()
+                        .fold(0u64, |mask, (i, policy)| {
+                            mask | (u64::from(policy.applies(ctx)) << i)
+                        });
+                    wayframe::adaptive::Workload {
+                        key,
+                        width: key.count_ones() as usize,
+                    }
+                },
+                profile.settings()?,
+            )?
+        } else {
+            selected
+        };
+        let selected = Arc::new(selected);
         policy.push(selected.clone());
         adaptive = Some(selected);
     }

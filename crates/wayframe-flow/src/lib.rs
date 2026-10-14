@@ -1,5 +1,7 @@
 //! Bounded typed DAG execution. Each node owns its output; joins never merge mutable contexts.
 mod plans;
+mod priority;
+pub use priority::{NodeCost, Priority};
 mod schedule;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 pub use plans::{CacheStatistics, Output, Prepared};
@@ -201,6 +203,8 @@ struct Node {
     kind: Kind,
     budget: Option<Duration>,
     discardable: bool,
+    cost_hint: Duration,
+    observed: priority::Observed,
 }
 struct Condition {
     dependency: usize,
@@ -211,11 +215,13 @@ struct Topology {
     dependents: Vec<Vec<usize>>,
     guarded: Vec<Vec<usize>>,
     gates: Vec<usize>,
+    scores: Vec<u64>,
 }
 pub struct Builder<C> {
     scope: Arc<()>,
     nodes: Vec<Node>,
     limits: Limits,
+    priority: Priority,
     marker: PhantomData<fn() -> C>,
 }
 pub struct Flow<C> {
@@ -226,6 +232,7 @@ pub struct Flow<C> {
     admission: Arc<Semaphore>,
     running: Arc<Semaphore>,
     plan_cache: Mutex<plans::Cache>,
+    priority: Priority,
     marker: PhantomData<fn() -> C>,
 }
 fn input<T: Send + Sync + 'static>(inputs: &[Option<Value>], i: usize) -> Arc<T> {
@@ -252,11 +259,14 @@ impl<C: Context + Sync> Builder<C> {
             kind: Kind::Work,
             budget: None,
             discardable: false,
+            cost_hint: Duration::ZERO,
+            observed: priority::Observed::default(),
         };
         Self {
             scope: Arc::new(()),
             nodes: vec![root],
             limits: Limits::default(),
+            priority: Priority::Stable,
             marker: PhantomData,
         }
     }
@@ -269,6 +279,10 @@ impl<C: Context + Sync> Builder<C> {
     }
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self
+    }
+    pub fn priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
         self
     }
     fn check<T>(&self, p: &Port<T>) -> Result<usize, Error> {
@@ -302,6 +316,8 @@ impl<C: Context + Sync> Builder<C> {
             kind,
             budget: None,
             discardable: false,
+            cost_hint: Duration::ZERO,
+            observed: priority::Observed::default(),
         });
         Ok(Port {
             scope: self.scope.clone(),
@@ -562,6 +578,14 @@ impl<C: Context + Sync> Builder<C> {
         self.nodes[n].discardable = true;
         Ok(())
     }
+    pub fn cost_hint<T>(&mut self, node: &Port<T>, cost: Duration) -> Result<(), Error> {
+        let n = self.check(node)?;
+        if n == 0 || cost > Duration::from_secs(120) {
+            return Err(Error::InvalidGraph("invalid_cost_hint"));
+        }
+        self.nodes[n].cost_hint = cost;
+        Ok(())
+    }
     pub fn compile(mut self) -> Result<Flow<C>, Error> {
         if !(1..=256).contains(&self.limits.max_parallel)
             || !(1..=100000).contains(&self.limits.max_executions)
@@ -644,6 +668,7 @@ impl<C: Context + Sync> Builder<C> {
             dependents: vec![vec![]; self.nodes.len()],
             guarded: vec![vec![]; self.nodes.len()],
             gates: vec![],
+            scores: vec![],
         };
         for (i, node) in self.nodes.iter().enumerate() {
             for dependency in &node.deps {
@@ -656,6 +681,7 @@ impl<C: Context + Sync> Builder<C> {
                 topology.gates.push(i);
             }
         }
+        topology.scores = priority::scores(&self.nodes, &topology, None, false);
         Ok(Flow {
             scope: self.scope,
             nodes: Arc::new(self.nodes),
@@ -664,6 +690,7 @@ impl<C: Context + Sync> Builder<C> {
             admission: Arc::new(Semaphore::new(self.limits.max_executions)),
             running: Arc::new(Semaphore::new(self.limits.max_running_nodes)),
             plan_cache: Mutex::new(plans::Cache::default()),
+            priority: self.priority,
             marker: PhantomData,
         })
     }
@@ -773,13 +800,25 @@ impl<C: Context + Sync> Flow<C> {
         values[0] = Some(context as Value);
         reports[0].state = State::Succeeded;
         let mut tasks: FuturesUnordered<Running> = FuturesUnordered::new();
-        let mut schedule = Schedule::new(&self.nodes);
+        let mut schedule = Schedule::new(&self.nodes, self.priority == Priority::Measured);
+        let measured_scores = (self.priority == Priority::Measured).then(|| {
+            priority::scores(
+                &self.nodes,
+                &self.topology,
+                plan.map(|plan| plan.active),
+                true,
+            )
+        });
+        let scores = measured_scores.as_deref().unwrap_or_else(|| {
+            plan.map_or(self.topology.scores.as_slice(), |plan| plan.scores.as_ref())
+        });
         let span = tracing::info_span!(
             "workflow.execution",
             workflow.nodes = self.nodes.len() - 1,
             workflow.branch_checks = tracing::field::Empty,
             workflow.pruned_nodes = tracing::field::Empty,
             workflow.prepared = plan.is_some(),
+            workflow.priority = ?self.priority,
             workflow.outcome = tracing::field::Empty
         );
         struct ExecutionGuard(Option<tracing::Span>);
@@ -805,7 +844,8 @@ impl<C: Context + Sync> Flow<C> {
                     return Err(Error::Deadline);
                 }
                 while tasks.len() < self.limits.max_parallel {
-                    let Some(i) = schedule.ready.pop_first() else {
+                    let Some(i) = schedule.next(self.priority, scores, &self.nodes, deadline)
+                    else {
                         break;
                     };
                     let node = &self.nodes[i];
@@ -842,6 +882,7 @@ impl<C: Context + Sync> Flow<C> {
                     let node_span = tracing::info_span!(
                         "workflow.node", node.id = %node.id, node.phase = ?node.phase,
                         node.dependencies = %node.dependencies, node.scheduling = ?scheduling,
+                        node.remaining_cost_ns = scores[i],
                         node.outcome = tracing::field::Empty,
                         node.scheduler_wait_ns = tracing::field::Empty,
                         node.dependency_wait_ns = ready.duration_since(start).as_nanos().min(u64::MAX as u128) as u64,
@@ -857,6 +898,8 @@ impl<C: Context + Sync> Flow<C> {
                         timer: NodeTimer {
                             span: node_span.clone(),
                             done: false,
+                            ready,
+                            started: None,
                         },
                     };
                     let completed = if let Some(permit) = inline_permit {

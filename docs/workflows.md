@@ -5,6 +5,51 @@ Each node reads immutable typed inputs and returns its own output. It never race
 request contexts. `join` names the merge; `choice` requires exactly one active input. `when` adds
 conditional execution, and skipped dependencies propagate until an explicit choice.
 
+```rust,ignore
+use wayframe::{flow::Builder, prelude::*};
+let mut builder = Builder::<MyContext>::new();
+let input = builder.input();
+let first = builder.asynchronous("first", Phase::Authorize, &input, |ctx| async move {
+    fetch_first(&ctx).await
+})?;
+let second = builder.asynchronous("second", Phase::Authorize, &input, |ctx| async move {
+    fetch_second(&ctx).await
+})?;
+let joined = builder.join("join", Phase::Authorize, &first, &second, |a, b| {
+    Ok(merge(&a, &b))
+})?;
+let after = builder.sync("followup", Phase::Limit, &joined, |result| {
+    Ok(sync_followup(&result))
+})?;
+let flow = builder.compile()?;
+let run = flow.run(context).await?;
+let value = run.get(&after);
+```
+
+Use `gate`/`gate_async` for mandatory policy decisions and `dispatch` for protected work. Compilation
+rejects cycles, foreign ports, reversed phases, oversized graphs, and dispatch nodes without every
+mandatory gate as a dependency. Gates cannot be conditional. Runtime validation also rejects a
+skipped gate, including in an embedded graph that dispatches afterward through its parent pipeline.
+A denial or failed node cancels siblings and prevents dispatch.
+A quorum helper is available for ordinary independent work; it cannot replace mandatory gates.
+
+The default limits bound executions, concurrent nodes per execution, and concurrent nodes across
+all executions of a flow. A node budget includes scheduler admission and is capped by the request
+deadline. Reports and OTEL spans distinguish dependency wait, scheduler wait and execution time.
+
+Async nodes must cooperate with cancellation. Dropping an execution drops its futures and resource
+leases; no work is detached by the scheduler. `run_finally` runs one synchronous cleanup callback on
+success, failure or cancellation, without replacing a denial. Keep sync nodes short. Use `CpuPool`
+for blocking/CPU work: running closures retain capacity after caller timeout until the work exits.
+Queued CPU closures are cancelled when their caller exits and check the deadline before starting.
+`Exclusive<T>` provides single-use ownership for a body, frame stream or other exclusive resource.
+
+`wayframe-http::workflow::FlowBlock` connects a graph through an explicit immutable projection and
+merge function. The MCP example uses this for the graph path of `[[async_policies]]`: applicable checks run in
+parallel, graph completion waits for all required gates, and current grants are rechecked before dispatch. Live tests
+use two HTTPS policy servers and a barrier, then verify overlapping node spans from an actual OTLP
+export. `flow_cost` compares warm graph scheduling against the same number of linear no-op blocks.
+
 `when_value` selects branches from any immutable `Eq + Send + Sync` fact, including an enum.
 `choice_many` rejoins several alternatives and requires exactly one output. A selector can depend
 on earlier async work, so later facts can resolve nested branches during the same invocation.
@@ -82,50 +127,26 @@ ports from the previous generation. `run_plan_finally` retains success/failure/c
 policy-join value this way: graph completion already waits for all retained gates. Every applicable
 policy result and mandatory gate still runs, and current permissions are checked after the graph.
 
-```rust,ignore
-use wayframe::{flow::Builder, prelude::*};
-let mut builder = Builder::<MyContext>::new();
-let input = builder.input();
-let first = builder.asynchronous("first", Phase::Authorize, &input, |ctx| async move {
-    fetch_first(&ctx).await
-})?;
-let second = builder.asynchronous("second", Phase::Authorize, &input, |ctx| async move {
-    fetch_second(&ctx).await
-})?;
-let joined = builder.join("join", Phase::Authorize, &first, &second, |a, b| {
-    Ok(merge(&a, &b))
-})?;
-let after = builder.sync("followup", Phase::Limit, &joined, |result| {
-    Ok(sync_followup(&result))
-})?;
-let flow = builder.compile()?;
-let run = flow.run(context).await?;
-let value = run.get(&after);
-```
+## Ordering slow work
 
-Use `gate`/`gate_async` for mandatory policy decisions and `dispatch` for protected work. Compilation
-rejects cycles, foreign ports, reversed phases, oversized graphs, and dispatch nodes without every
-mandatory gate as a dependency. Gates cannot be conditional. Runtime validation also rejects a
-skipped gate, including in an embedded graph that dispatches afterward through its parent pipeline.
-A denial or failed node cancels siblings and prevents dispatch.
-A quorum helper is available for ordinary independent work; it cannot replace mandatory gates.
+`Builder::priority(Priority::CriticalPath)` starts ready work on the longest remaining path earlier,
+using optional `cost_hint` durations. `Priority::Measured` uses successful node execution timings
+after three observations and falls back to hints before that. Observations are bounded by the
+compiled node set, contain durations and sample counts, and start fresh on a new generation.
+`node_costs` exposes them. No node crosses a dependency. Ready mandatory gates take precedence;
+ready node budgets take precedence over cost hints. The original request deadline remains fixed.
 
-The default limits bound executions, concurrent nodes per execution, and concurrent nodes across
-all executions of a flow. A node budget includes scheduler admission and is capped by the request
-deadline. Reports and OTEL spans distinguish dependency wait, scheduler wait and execution time.
+With two slots, jobs of 10/10/80 ms started in creation order take 90 ms. Starting the 80 ms job
+earlier takes 80 ms. Deterministic delayed-node tests demonstrate an 85 ms deadline expiring for
+creation order and passing for critical-path order, then learn the same ordering without hints.
+Other tests cover several budgets, an omitted slow node, ready gate denial, and an impossible
+required path that still expires. Cost-aware scheduling is optional because scanning priorities and
+collecting observations adds overhead to small native graphs. Timings are estimates, not guarantees.
 
-Async nodes must cooperate with cancellation. Dropping an execution drops its futures and resource
-leases; no work is detached by the scheduler. `run_finally` runs one synchronous cleanup callback on
-success, failure or cancellation, without replacing a denial. Keep sync nodes short. Use `CpuPool`
-for blocking/CPU work: running closures retain capacity after caller timeout until the work exits.
-Queued CPU closures are cancelled when their caller exits and check the deadline before starting.
-`Exclusive<T>` provides single-use ownership for a body, frame stream or other exclusive resource.
-
-`wayframe-http::workflow::FlowBlock` connects a graph through an explicit immutable projection and
-merge function. The MCP example uses this for the graph path of `[[async_policies]]`: applicable checks run in
-parallel, a sync join waits for them, and current grants are rechecked before dispatch. Live tests
-use two HTTPS policy servers and a barrier, then verify overlapping node spans from an actual OTLP
-export. `flow_cost` compares warm graph scheduling against the same number of linear no-op blocks.
+The MCP gateway exposes `async_max_parallel` (1–16, default 16), `async_priority` (`stable`,
+`critical_path`, `measured`) and each policy's optional `estimated_ms` hint (at most 120000).
+Use a smaller parallel limit to measure ordering under admission pressure. Node spans export
+`node.remaining_cost_ns`; execution spans identify `workflow.priority`.
 
 ## Runtime path selection
 
@@ -176,3 +197,37 @@ parallel overlap and terminal denials; microbenchmarks measure selection overhea
 `flow_cost` also reports `branch_cases` for selected and pruned optional chains of 1, 16, 64 and 128
 nodes, with seven timing batches and the executed/pruned counts. These are warm native no-op graphs
 with tracing disabled, rather than network latency or production capacity estimates.
+
+## Measured choice of linear or graph paths
+
+`Adaptive::with_profile` optionally compares equivalent prepared paths using a trusted `Workload`
+classifier with a bounded integer class key and independent width. Success timings feed a rolling
+cost estimate. Warmup samples one path per request; after both paths have enough samples, a margin
+prevents switching for small timing differences. Occasional exploration can refresh estimates.
+Each invocation executes one path. Errors, denials and timeouts remain terminal and do not train a
+path as cheaper. Explicit operator rules, admission-pressure choices and small workloads stay
+authoritative. Selector/classifier panics reject the request before either path runs.
+
+The default model holds at most 64 classes, requires eight successful samples per path, explores
+every 64 eligible calls, uses a 10% improvement margin, and expires stale estimates after 60 seconds.
+Exploration requires remaining budget; a conservative bound scales a known parallel timing by the
+independent width before trying an unproven serial path. Estimates cannot guarantee completion, so
+the shared deadline still caps execution. Eviction/expiry ignores late observations from old class
+instances. No identities, request values, branch outcomes or permission decisions are cached.
+
+The gateway enables this with an optional top-level `async_profile` table and classifies by the exact
+applicable policy bitmask. `/metrics` exposes bounded class counts, warmup/exploration selections,
+budget skips, successes, failures and evictions. Models are local to one prepared generation.
+
+```toml
+async_max_parallel = 2
+async_priority = "measured"
+
+[async_profile]
+min_samples = 8
+explore_every = 64
+improvement_percent = 10
+ttl_seconds = 60
+capacity = 64
+min_budget_ms = 10
+```
