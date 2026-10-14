@@ -49,6 +49,39 @@ scheduler and execution time for pruned nodes. OTLP exports `workflow.branch` se
 `workflow.pruned_nodes`. These measurements describe work saved; spans and reporting still have a
 cost. Use the release benchmark to assess that cost for your graph and tracing configuration.
 
+The scheduler adapts to the ready frontier within one invocation. A ready synchronous node executes
+inline after acquiring capacity. One async path uses serial scheduling; independent async paths use
+parallel scheduling. A join can therefore return directly to synchronous work without allocating an
+executor future for each step. `NodeReport::scheduling` and OTLP `node.scheduling` identify `Inline`,
+`Serial` or `Parallel`. All modes enforce the same node/global limits, deadlines and mandatory gates.
+Late synchronous results are rejected before any dependent work can start.
+
+## Prepared output plans
+
+Ordinary work is retained by default because it can have side effects or required errors. An author
+can explicitly mark a node `discardable` when its action, errors and effects may be omitted if no
+requested output or retained control needs it. Gates, dispatch and input cannot be marked discardable.
+Preparation retains every unannotated node and control, then includes all of their ancestors and all
+requested output ancestors, including selectors. Runtime branch decisions still use current facts.
+
+```rust,ignore
+builder.discardable(&optional_enrichment)?;
+let flow = builder.compile()?;
+let prepared = flow.prepare(&[response.output()])?;
+let run = flow.run_plan(context, &prepared).await?;
+```
+
+`Prepared` can be reused concurrently. A generation-owned 32-entry LRU caches only structural masks
+for exact sets of requested outputs. It stores no request values, identities or policy decisions.
+Preparing the same output set again is cheap; `plan_statistics` exposes hits, misses and evictions.
+Eviction does not invalidate an already prepared plan. A new compiled generation rejects plans and
+ports from the previous generation. `run_plan_finally` retains success/failure/cancellation cleanup.
+`UnrequestedOutput` reports identify omitted work with zero execution and wait time.
+
+`FlowBlock::with_plan` validates and embeds a prepared plan. The reference gateway removes its unused
+policy-join value this way: graph completion already waits for all retained gates. Every applicable
+policy result and mandatory gate still runs, and current permissions are checked after the graph.
+
 ```rust,ignore
 use wayframe::{flow::Builder, prelude::*};
 let mut builder = Builder::<MyContext>::new();

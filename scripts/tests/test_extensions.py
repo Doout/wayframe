@@ -283,7 +283,13 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
             for s in receiver.spans()
             if s["name"] == "workflow.execution" and s["trace_id"] == first_trace
         )
-        self.assertEqual(int(execution["attributes"]["workflow.pruned_nodes"]), 3)
+        self.assertEqual(int(execution["attributes"]["workflow.pruned_nodes"]), 4)
+        unused_join = next(
+            s for s in first_nodes if s["attributes"].get("node.id") == "policy-join"
+        )
+        self.assertEqual(unused_join["attributes"]["node.skip_reason"], "UnrequestedOutput")
+        self.assertTrue(execution["attributes"]["workflow.prepared"])
+        self.assertEqual(a["attributes"]["node.scheduling"], "Parallel")
         selected = [
             s
             for s in receiver.spans()

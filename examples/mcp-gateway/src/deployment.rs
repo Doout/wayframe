@@ -289,7 +289,10 @@ pub(crate) async fn prepare_deployment(
         for gate in &gates {
             graph.depends_on(&joined, gate)?;
         }
+        // Flow completion already waits for every mandatory gate; this unused value is discardable.
+        graph.discardable(&joined)?;
         let graph = graph.compile()?;
+        let prepared = graph.prepare(&[])?;
         let linear = Pipeline::compile(
             checks
                 .iter()
@@ -297,19 +300,22 @@ pub(crate) async fn prepare_deployment(
                 .map(|c| c as Arc<dyn Block<RequestContext>>)
                 .collect(),
         )?;
-        let parallel = Arc::new(wayframe::http::workflow::FlowBlock::new(
-            "parallel-policies",
-            Phase::Authorize,
-            graph,
-            |ctx| {
-                let mut view = ctx.clone();
-                view.body = None;
-                view.headers = axum::http::HeaderMap::new();
-                view.extensions = Default::default();
-                view
-            },
-            |_, _| Decision::Continue,
-        ));
+        let parallel = Arc::new(
+            wayframe::http::workflow::FlowBlock::new(
+                "parallel-policies",
+                Phase::Authorize,
+                graph,
+                |ctx| {
+                    let mut view = ctx.clone();
+                    view.body = None;
+                    view.headers = axum::http::HeaderMap::new();
+                    view.extensions = Default::default();
+                    view
+                },
+                |_, _| Decision::Continue,
+            )
+            .with_plan(prepared)?,
+        );
         let threshold = config.async_parallel_threshold;
         let selected = Arc::new(wayframe::adaptive::Adaptive::new(
             "adaptive-policies",

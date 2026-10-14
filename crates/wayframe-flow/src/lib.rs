@@ -1,14 +1,18 @@
 //! Bounded typed DAG execution. Each node owns its output; joins never merge mutable contexts.
-use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
+mod plans;
+mod schedule;
+use futures_util::{stream::FuturesUnordered, StreamExt};
+pub use plans::{CacheStatistics, Output, Prepared};
+use schedule::{accept, Arguments, NodeSet, NodeTimer, Schedule, Step};
 use std::{
     any::{Any, TypeId},
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::HashSet,
     fmt,
     future::Future,
     marker::PhantomData,
     panic::AssertUnwindSafe,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -18,9 +22,32 @@ use tokio::{
 use tracing::Instrument;
 use wayframe_core::{Context, Decision, Phase, Reason, Task};
 type Value = Arc<dyn Any + Send + Sync>;
-type Action = Arc<dyn Fn(Vec<Option<Value>>) -> Task<Value, Error> + Send + Sync>;
-type Running =
-    Pin<Box<dyn Future<Output = (usize, Duration, Duration, Result<Value, Error>)> + Send>>;
+type Invoke = Arc<dyn Fn(&[Option<Value>]) -> Task<Value, Error> + Send + Sync>;
+#[derive(Clone)]
+struct Action {
+    invoke: Invoke,
+    immediate: bool,
+}
+impl Action {
+    fn immediate(
+        f: impl Fn(&[Option<Value>]) -> Task<Value, Error> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            invoke: Arc::new(f),
+            immediate: true,
+        }
+    }
+    fn deferred(
+        f: impl Fn(&[Option<Value>]) -> Task<Value, Error> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            invoke: Arc::new(f),
+            immediate: false,
+        }
+    }
+}
+type Completed = (usize, Duration, Duration, Result<Value, Error>);
+type Running = Pin<Box<dyn Future<Output = Completed> + Send>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -88,11 +115,19 @@ pub struct NodeReport {
     pub elapsed: Duration,
     /// Why the node was removed from this invocation's executable graph.
     pub skip_reason: Option<SkipReason>,
+    pub scheduling: Option<Scheduling>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheduling {
+    Inline,
+    Serial,
+    Parallel,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkipReason {
     BranchNotSelected,
     DependencySkipped,
+    UnrequestedOutput,
 }
 pub struct Run {
     scope: Arc<()>,
@@ -161,9 +196,11 @@ struct Node {
     input_types: Vec<TypeId>,
     output: TypeId,
     action: Action,
+    dependencies: String,
     condition: Option<Condition>,
     kind: Kind,
     budget: Option<Duration>,
+    discardable: bool,
 }
 struct Condition {
     dependency: usize,
@@ -188,6 +225,7 @@ pub struct Flow<C> {
     limits: Limits,
     admission: Arc<Semaphore>,
     running: Arc<Semaphore>,
+    plan_cache: Mutex<plans::Cache>,
     marker: PhantomData<fn() -> C>,
 }
 fn input<T: Send + Sync + 'static>(inputs: &[Option<Value>], i: usize) -> Arc<T> {
@@ -206,10 +244,14 @@ impl<C: Context + Sync> Builder<C> {
             deps: vec![],
             input_types: vec![],
             output: TypeId::of::<C>(),
-            action: Arc::new(|_| Task::Immediate(Err(Error::Failed("input_not_executable")))),
+            action: Action::immediate(|_| {
+                Task::Immediate(Err(Error::Failed("input_not_executable")))
+            }),
+            dependencies: String::new(),
             condition: None,
             kind: Kind::Work,
             budget: None,
+            discardable: false,
         };
         Self {
             scope: Arc::new(()),
@@ -255,9 +297,11 @@ impl<C: Context + Sync> Builder<C> {
             input_types: types,
             output: TypeId::of::<O>(),
             action,
+            dependencies: String::new(),
             condition: None,
             kind,
             budget: None,
+            discardable: false,
         });
         Ok(Port {
             scope: self.scope.clone(),
@@ -283,7 +327,9 @@ impl<C: Context + Sync> Builder<C> {
             phase,
             vec![dep],
             vec![TypeId::of::<I>()],
-            Arc::new(move |args| Task::Immediate(f(input(&args, 0)).map(|v| Arc::new(v) as Value))),
+            Action::immediate(move |args| {
+                Task::Immediate(f(input(args, 0)).map(|v| Arc::new(v) as Value))
+            }),
             Kind::Work,
         )
     }
@@ -306,8 +352,8 @@ impl<C: Context + Sync> Builder<C> {
             phase,
             vec![dep],
             vec![TypeId::of::<I>()],
-            Arc::new(move |args| {
-                let future = f(input(&args, 0));
+            Action::deferred(move |args| {
+                let future = f(input(args, 0));
                 Task::Deferred(Box::pin(async move {
                     future.await.map(|v| Arc::new(v) as Value)
                 }))
@@ -335,8 +381,8 @@ impl<C: Context + Sync> Builder<C> {
             phase,
             deps,
             vec![TypeId::of::<A>(), TypeId::of::<B>()],
-            Arc::new(move |args| {
-                Task::Immediate(f(input(&args, 0), input(&args, 1)).map(|v| Arc::new(v) as Value))
+            Action::immediate(move |args| {
+                Task::Immediate(f(input(args, 0), input(args, 1)).map(|v| Arc::new(v) as Value))
             }),
             Kind::Work,
         )
@@ -374,8 +420,8 @@ impl<C: Context + Sync> Builder<C> {
             phase,
             deps,
             vec![TypeId::of::<T>(); count],
-            Arc::new(move |args| {
-                let mut active = args.into_iter().take(count).flatten();
+            Action::immediate(move |args| {
+                let mut active = args.iter().take(count).flatten().cloned();
                 let first = active.next();
                 Task::Immediate(match (first, active.next()) {
                     (Some(value), None) => Ok(value),
@@ -403,8 +449,8 @@ impl<C: Context + Sync> Builder<C> {
             phase,
             vec![dep],
             vec![TypeId::of::<I>()],
-            Arc::new(move |args| {
-                Task::Immediate(match f(&*input(&args, 0)) {
+            Action::immediate(move |args| {
+                Task::Immediate(match f(&*input(args, 0)) {
                     Decision::Continue => Ok(Arc::new(()) as Value),
                     Decision::Deny { reason, code } => Err(Error::Denied(reason, code)),
                 })
@@ -506,7 +552,17 @@ impl<C: Context + Sync> Builder<C> {
         self.nodes[n].budget = Some(duration);
         Ok(())
     }
-    pub fn compile(self) -> Result<Flow<C>, Error> {
+    /// Opt in to omitting ordinary work when no requested output or retained control needs it.
+    /// Its action, errors and side effects must be safe to omit. Gates and dispatch cannot opt in.
+    pub fn discardable<T>(&mut self, node: &Port<T>) -> Result<(), Error> {
+        let n = self.check(node)?;
+        if n == 0 || matches!(self.nodes[n].kind, Kind::Gate | Kind::Dispatch) {
+            return Err(Error::InvalidGraph("discardable_control"));
+        }
+        self.nodes[n].discardable = true;
+        Ok(())
+    }
+    pub fn compile(mut self) -> Result<Flow<C>, Error> {
         if !(1..=256).contains(&self.limits.max_parallel)
             || !(1..=100000).contains(&self.limits.max_executions)
             || !(1..=100000).contains(&self.limits.max_running_nodes)
@@ -570,6 +626,20 @@ impl<C: Context + Sync> Builder<C> {
                 return Err(Error::InvalidGraph("dispatch_bypasses_mandatory_gate"));
             }
         }
+        let dependencies: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|node| {
+                node.deps
+                    .iter()
+                    .map(|d| self.nodes[*d].id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        for (node, dependencies) in self.nodes.iter_mut().zip(dependencies) {
+            node.dependencies = dependencies;
+        }
         let mut topology = Topology {
             dependents: vec![vec![]; self.nodes.len()],
             guarded: vec![vec![]; self.nodes.len()],
@@ -593,6 +663,7 @@ impl<C: Context + Sync> Builder<C> {
             limits: self.limits,
             admission: Arc::new(Semaphore::new(self.limits.max_executions)),
             running: Arc::new(Semaphore::new(self.limits.max_running_nodes)),
+            plan_cache: Mutex::new(plans::Cache::default()),
             marker: PhantomData,
         })
     }
@@ -600,117 +671,6 @@ impl<C: Context + Sync> Builder<C> {
 impl<C: Context + Sync> Default for Builder<C> {
     fn default() -> Self {
         Self::new()
-    }
-}
-struct NodeTimer {
-    span: tracing::Span,
-    done: bool,
-}
-/// Per-invocation partial evaluation. Resolved facts remove inactive paths before scheduling them.
-struct Schedule {
-    remaining: Vec<usize>,
-    ready: BTreeSet<usize>,
-    ready_at: Vec<Option<Instant>>,
-    settled: VecDeque<usize>,
-    pending: usize,
-    branch_checks: usize,
-    pruned: usize,
-}
-impl Schedule {
-    fn new(nodes: &[Node]) -> Self {
-        Self {
-            remaining: nodes.iter().map(|node| node.deps.len()).collect(),
-            ready: BTreeSet::new(),
-            ready_at: vec![None; nodes.len()],
-            settled: VecDeque::with_capacity(nodes.len()),
-            pending: nodes.len() - 1,
-            branch_checks: 0,
-            pruned: 0,
-        }
-    }
-    fn skip(&mut self, i: usize, reason: SkipReason, reports: &mut [NodeReport], start: Instant) {
-        self.ready.remove(&i);
-        self.ready_at[i] = None;
-        self.pending -= 1;
-        self.pruned += 1;
-        reports[i].state = State::Skipped;
-        reports[i].dependency_wait = start.elapsed();
-        reports[i].skip_reason = Some(reason);
-        // Pruning is observable but never takes a node execution permit or invokes its action.
-        let span = tracing::info_span!("workflow.node", node.id = %reports[i].id,
-            node.outcome = "skipped", node.skip_reason = ?reason,
-            node.dependency_wait_ns = reports[i].dependency_wait.as_nanos().min(u64::MAX as u128) as u64,
-            node.scheduler_wait_ns = 0u64, node.execution_ns = 0u64);
-        drop(span);
-    }
-    fn complete(
-        &mut self,
-        completed: usize,
-        nodes: &[Node],
-        topology: &Topology,
-        values: &[Option<Value>],
-        reports: &mut [NodeReport],
-        start: Instant,
-    ) -> Result<(), Error> {
-        self.settled.push_back(completed);
-        while let Some(dependency) = self.settled.pop_front() {
-            // Resolve guards first, even when their other dependencies are still running.
-            for &i in &topology.guarded[dependency] {
-                if reports[i].state != State::Pending {
-                    continue;
-                }
-                let condition = nodes[i].condition.as_ref().expect("compiled guard");
-                let span = tracing::info_span!("workflow.branch", node.id = %nodes[i].id,
-                    branch.selector = %nodes[dependency].id, branch.selected = tracing::field::Empty);
-                self.branch_checks += 1;
-                let selected = span
-                    .in_scope(|| {
-                        std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            values[dependency]
-                                .as_ref()
-                                .is_some_and(|value| (condition.matches)(value))
-                        }))
-                    })
-                    .map_err(|_| Error::Panic)?;
-                span.record("branch.selected", selected);
-                drop(span);
-                if !selected {
-                    self.skip(i, SkipReason::BranchNotSelected, reports, start);
-                    self.settled.push_back(i);
-                }
-            }
-            for &i in &topology.dependents[dependency] {
-                if reports[i].state != State::Pending {
-                    continue;
-                }
-                if reports[dependency].state == State::Skipped && nodes[i].kind != Kind::Choice {
-                    self.skip(i, SkipReason::DependencySkipped, reports, start);
-                    // A graph may be embedded before dispatch in another pipeline. Its mandatory
-                    // gates must fail closed here, even when it has no internal dispatch node.
-                    if nodes[i].kind == Kind::Gate {
-                        return Err(Error::Denied(
-                            Reason::Forbidden,
-                            "mandatory_gate_not_satisfied",
-                        ));
-                    }
-                    self.settled.push_back(i);
-                } else {
-                    self.remaining[i] -= 1;
-                    if self.remaining[i] == 0 {
-                        self.ready.insert(i);
-                        self.ready_at[i] = Some(Instant::now());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-impl Drop for NodeTimer {
-    fn drop(&mut self) {
-        if !self.done {
-            self.span.record("node.outcome", "cancelled");
-        }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -722,6 +682,29 @@ pub enum Completion {
 impl<C: Context + Sync> Flow<C> {
     /// A synchronous cleanup callback runs on success, failure and cancellation. It cannot replace a denial.
     pub async fn run_finally<F>(&self, context: Arc<C>, finally: F) -> Result<Run, Failure>
+    where
+        F: FnOnce(Completion) + Send,
+    {
+        self.run_finally_selected(context, None, finally).await
+    }
+    pub async fn run_plan_finally<F>(
+        &self,
+        context: Arc<C>,
+        plan: &Prepared,
+        finally: F,
+    ) -> Result<Run, Failure>
+    where
+        F: FnOnce(Completion) + Send,
+    {
+        self.run_finally_selected(context, Some(plan), finally)
+            .await
+    }
+    async fn run_finally_selected<F>(
+        &self,
+        context: Arc<C>,
+        plan: Option<&Prepared>,
+        finally: F,
+    ) -> Result<Run, Failure>
     where
         F: FnOnce(Completion) + Send,
     {
@@ -740,7 +723,7 @@ impl<C: Context + Sync> Flow<C> {
             callback: Some(finally),
             outcome: Completion::Cancelled,
         };
-        let result = self.run(context).await;
+        let result = self.run_selected(context, plan).await;
         guard.outcome = if result.is_ok() {
             Completion::Succeeded
         } else {
@@ -750,6 +733,12 @@ impl<C: Context + Sync> Flow<C> {
     }
 
     pub async fn run(&self, context: Arc<C>) -> Result<Run, Failure> {
+        self.run_selected(context, None).await
+    }
+    pub async fn run_plan(&self, context: Arc<C>, plan: &Prepared) -> Result<Run, Failure> {
+        self.run_selected(context, Some(plan)).await
+    }
+    async fn run_selected(&self, context: Arc<C>, plan: Option<&Prepared>) -> Result<Run, Failure> {
         let deadline: Instant = context.deadline().into();
         let start = Instant::now();
         let mut reports: Vec<_> = self
@@ -762,8 +751,15 @@ impl<C: Context + Sync> Flow<C> {
                 scheduler_wait: Duration::ZERO,
                 elapsed: Duration::ZERO,
                 skip_reason: None,
+                scheduling: None,
             })
             .collect();
+        if plan.is_some_and(|plan| !plan.belongs_to(self)) {
+            return Err(Failure {
+                error: Error::InvalidGraph("foreign_plan"),
+                nodes: reports,
+            });
+        }
         let _admission = match self.admission.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -783,6 +779,7 @@ impl<C: Context + Sync> Flow<C> {
             workflow.nodes = self.nodes.len() - 1,
             workflow.branch_checks = tracing::field::Empty,
             workflow.pruned_nodes = tracing::field::Empty,
+            workflow.prepared = plan.is_some(),
             workflow.outcome = tracing::field::Empty
         );
         struct ExecutionGuard(Option<tracing::Span>);
@@ -795,6 +792,13 @@ impl<C: Context + Sync> Flow<C> {
         }
         let mut guard = ExecutionGuard(Some(span.clone()));
         let execution = async {
+            if let Some(plan) = plan {
+                for i in 1..self.nodes.len() {
+                    if !plan.active.contains(i) {
+                        schedule.skip(i, SkipReason::UnrequestedOutput, &mut reports, start);
+                    }
+                }
+            }
             schedule.complete(0, &self.nodes, &self.topology, &values, &mut reports, start)?;
             loop {
                 if Instant::now() >= deadline {
@@ -822,72 +826,56 @@ impl<C: Context + Sync> Flow<C> {
                     }
                     reports[i].state = State::Running;
                     schedule.pending -= 1;
-                    let args = node.deps.iter().map(|d| values[*d].clone()).collect();
-                    let action = node.action.clone();
-                    let semaphore = self.running.clone();
-                    let end = node.budget.map_or(deadline, |d| deadline.min(ready + d));
-                    let dependencies = node
-                        .deps
-                        .iter()
-                        .map(|d| self.nodes[*d].id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",");
+                    let inline_permit = if node.action.immediate {
+                        self.running.clone().try_acquire_owned().ok()
+                    } else {
+                        None
+                    };
+                    let scheduling = if inline_permit.is_some() {
+                        Scheduling::Inline
+                    } else if tasks.is_empty() && schedule.ready.is_empty() {
+                        Scheduling::Serial
+                    } else {
+                        Scheduling::Parallel
+                    };
+                    reports[i].scheduling = Some(scheduling);
                     let node_span = tracing::info_span!(
                         "workflow.node", node.id = %node.id, node.phase = ?node.phase,
-                        node.dependencies = %dependencies, node.outcome = tracing::field::Empty,
+                        node.dependencies = %node.dependencies, node.scheduling = ?scheduling,
+                        node.outcome = tracing::field::Empty,
                         node.scheduler_wait_ns = tracing::field::Empty,
                         node.dependency_wait_ns = ready.duration_since(start).as_nanos().min(u64::MAX as u128) as u64,
                         node.execution_ns = tracing::field::Empty
                     );
-                    let instrumentation = node_span.clone();
-                    let timer = NodeTimer {
-                        span: node_span.clone(),
-                        done: false,
+                    let step = Step {
+                        index: i,
+                        ready,
+                        end: node.budget.map_or(deadline, |d| deadline.min(ready + d)),
+                        args: Arguments::new(node, &values),
+                        action: node.action.clone(),
+                        semaphore: self.running.clone(),
+                        timer: NodeTimer {
+                            span: node_span.clone(),
+                            done: false,
+                        },
                     };
-                    tasks.push(Box::pin(
-                        async move {
-                            let mut timer = timer;
-                            let mut execution_start = None;
-                            let execute = async {
-                                let _permit = semaphore
-                                    .acquire_owned()
-                                    .await
-                                    .map_err(|_| Error::Overloaded)?;
-                                // Budgets also include waiting for this flow's parallel slots.
-                                if Instant::now() >= end {
-                                    return Err(Error::Deadline);
-                                }
-                                execution_start = Some(Instant::now());
-                                action(args).resolve().await
-                            };
-                            let value =
-                                match timeout_at(end, AssertUnwindSafe(execute).catch_unwind())
-                                    .await
-                                {
-                                    Ok(Ok(result)) => result,
-                                    Ok(Err(_)) => Err(Error::Panic),
-                                    Err(_) => Err(Error::Deadline),
-                                };
-                            let scheduler_wait = execution_start
-                                .map_or_else(|| ready.elapsed(), |s| s.duration_since(ready));
-                            let elapsed = execution_start.map_or(Duration::ZERO, |s| s.elapsed());
-                            node_span.record(
-                                "node.scheduler_wait_ns",
-                                scheduler_wait.as_nanos().min(u64::MAX as u128) as u64,
-                            );
-                            node_span.record(
-                                "node.execution_ns",
-                                elapsed.as_nanos().min(u64::MAX as u128) as u64,
-                            );
-                            node_span.record(
-                                "node.outcome",
-                                value.as_ref().map_or_else(|e| e.outcome(), |_| "succeeded"),
-                            );
-                            timer.done = true;
-                            (i, scheduler_wait, elapsed, value)
-                        }
-                        .instrument(instrumentation),
-                    ));
+                    let completed = if let Some(permit) = inline_permit {
+                        node_span.in_scope(|| step.inline(permit))
+                    } else if scheduling == Scheduling::Serial {
+                        step.run().instrument(node_span).await
+                    } else {
+                        tasks.push(Box::pin(step.run().instrument(node_span)));
+                        continue;
+                    };
+                    accept(
+                        completed,
+                        &mut schedule,
+                        &self.nodes,
+                        &self.topology,
+                        &mut values,
+                        &mut reports,
+                        start,
+                    )?;
                 }
                 if schedule.pending == 0 && tasks.is_empty() {
                     return Ok(());
@@ -899,32 +887,21 @@ impl<C: Context + Sync> Flow<C> {
                 let waiting_deadline = schedule
                     .ready
                     .iter()
-                    .filter_map(|i| Some(schedule.ready_at[*i]? + self.nodes[*i].budget?))
+                    .filter_map(|i| Some(schedule.ready_at[i]? + self.nodes[i].budget?))
                     .min()
                     .unwrap_or(deadline)
                     .min(deadline);
                 match timeout_at(waiting_deadline, tasks.next()).await {
-                    Ok(Some((i, scheduler_wait, elapsed, value))) => {
-                        reports[i].scheduler_wait = scheduler_wait;
-                        reports[i].elapsed = elapsed;
-                        match value {
-                            Ok(value) => {
-                                values[i] = Some(value);
-                                reports[i].state = State::Succeeded;
-                                schedule.complete(
-                                    i,
-                                    &self.nodes,
-                                    &self.topology,
-                                    &values,
-                                    &mut reports,
-                                    start,
-                                )?;
-                            }
-                            Err(error) => {
-                                reports[i].state = State::Failed;
-                                return Err(error);
-                            }
-                        }
+                    Ok(Some(completed)) => {
+                        accept(
+                            completed,
+                            &mut schedule,
+                            &self.nodes,
+                            &self.topology,
+                            &mut values,
+                            &mut reports,
+                            start,
+                        )?;
                     }
                     Ok(None) => {}
                     Err(_) => {
