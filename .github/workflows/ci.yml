@@ -28,7 +28,7 @@ jobs:
           rustup show active-toolchain
       - name: Verify source, libraries, optional plugins, and live gateway
         run: bash scripts/verify.sh
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-tools
           key: wasm-tools-${{ runner.os }}-1.261.0
