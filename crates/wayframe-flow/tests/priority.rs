@@ -96,6 +96,65 @@ async fn longest_ready_path_meets_a_deadline_that_creation_order_misses() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn longest_downstream_chain_precedes_a_larger_single_job_without_crossing_dependencies() {
+    for priority in [Priority::Stable, Priority::CriticalPath] {
+        let mut b = Builder::<Work>::new().priority(priority).limits(Limits {
+            max_parallel: 2,
+            max_executions: 1,
+            max_running_nodes: 2,
+        });
+        let root = b.input();
+        let gate = b
+            .gate("authorize", Phase::Authenticate, &root, |_| {
+                Decision::Continue
+            })
+            .unwrap();
+        let mut inputs = vec![];
+        for (id, ms) in [("single", 120), ("other", 75), ("chain-start", 50)] {
+            let port = b
+                .asynchronous(id, Phase::Inspect, &root, move |_| async move {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    Ok(ms)
+                })
+                .unwrap();
+            b.cost_hint(&port, Duration::from_millis(ms)).unwrap();
+            inputs.push(port);
+        }
+        let tail = b
+            .asynchronous(
+                "chain-end",
+                Phase::Inspect,
+                &inputs[2],
+                |value| async move {
+                    assert_eq!(*value, 50);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(*value + 100)
+                },
+            )
+            .unwrap();
+        b.cost_hint(&tail, Duration::from_millis(100)).unwrap();
+        let dispatch = b
+            .dispatch("dispatch", &tail, |value| async move { Ok(*value) })
+            .unwrap();
+        for dependency in &inputs[..2] {
+            b.depends_on(&dispatch, dependency).unwrap();
+        }
+        b.depends_on(&dispatch, &gate).unwrap();
+        let flow = b.compile().unwrap();
+        let started = tokio::time::Instant::now();
+        let result = flow.run(work(210, true)).await;
+        if priority == Priority::Stable {
+            assert_eq!(result.unwrap_err().error, Error::Deadline);
+        } else {
+            let run = result.unwrap();
+            assert_eq!(run.get(&dispatch), Some(&150));
+            assert_eq!(started.elapsed(), Duration::from_millis(195));
+            assert_eq!(run.nodes[5].dependency_wait, Duration::from_millis(50));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn measured_node_costs_reorder_later_invocations_without_hints() {
     let starts = Arc::new(Mutex::new(vec![]));
     let writes = Arc::new(AtomicUsize::new(0));
