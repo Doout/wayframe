@@ -1,69 +1,47 @@
 # Security
 
-**Do not deploy this package as an internet-facing or hostile-tenant gateway before completing
-build verification and an independent security review. No security certification is claimed.**
+Wayframe is an alpha. Run [verification](docs/testing.md#verification) and obtain an
+independent security review before exposing it on the public internet or to hostile tenants.
 
-Trusted: application/native block code, operator configuration, plugin manifests and artifact
-directories, selected upstream/policy endpoints, authentication configuration, runtime/build tools.
-Untrusted: client headers/bodies, MCP metadata/tool arguments, guest plugin execution and external
-policy responses. Privileged plugin installation and configuration publication are operator tasks.
+## Trust boundaries
 
-## Implemented controls
+Native blocks, configuration, plugin manifests, artifact directories, and selected upstreams
+are trusted. Native code can run arbitrary process code. Cooperative cancellation cannot stop
+a blocking callback or native compilation. The stdio supervisor bounds its child and pending
+calls; it does not contain an entire process tree. Use OS isolation for untrusted native code
+or compiler inputs.
 
-Terminal denial; bounded pipeline identifiers/cardinality; preflight authentication before optional
-body collection; separate upstream credentials; exact origin checks in the demo; registered upstream
-origins; removal of spoofed identity/hop headers; no automatic redirects/proxies/retries; conservative
-path normalization; per-request and stream limits; bounded local token-bucket cardinality; bounded
-external frames with correlation and peer validation; narrow Wasm metadata grants; no WASI or
-arbitrary host imports; guest fuel/memory/deadline budgets; fresh single-use guest instances.
+Client input, MCP arguments, guest execution, and external policy responses are untrusted.
+Denials are terminal. The gateway bounds metadata, bodies, admission, deadlines, and external
+frames; strips spoofable identity headers; and uses separate upstream credentials.
+It disables automatic redirects, ambient proxies, and tool-call retries.
 
-See [verification instructions](CONTRIBUTING.md#verification) for development checks.
+Wasm receives only granted metadata. It has no WASI, filesystem, network, or arbitrary host
+imports. Each invocation consumes a fresh instance under fuel, memory, and deadline budgets.
+SHA-256 checks artifact identity; Ed25519 trust verifies its publisher and signed limits.
+Publisher trust does not grant capabilities. Artifact directories must remain operator-owned.
+Guest memory reservations do not cap total process RSS, and epoch deadlines are approximate.
 
-## Deliberate limitations
+## Deployment limits
 
-Native blocks can execute arbitrary process code and must be trusted. A cooperative future timeout
-is not a process kill. Host compilation can consume resources and cannot be preempted by dropping
-its async caller. A malicious runtime exploit is outside WIT capability isolation. Use distinct,
-unprivileged OS processes/containers with owned cgroups, network policy and filesystem isolation
-for mutually hostile tenants or untrusted compiler inputs. The stdio supervisor bounds its own child and pending calls; it does not claim total process-tree,
-container or hostile-compiler containment.
+Managed credentials are stored as token digests in a private, exclusively locked state file.
+Keep client, admin, and upstream secrets separate. Permissions come from trusted configuration
+or verified JWT claims, never client headers, annotations, or MCP client metadata.
+The gateway validates RS256 tokens but does not run an authorization server.
 
-SHA-256 detects artifact mismatches. Optional Ed25519 trust authenticates the publisher and binds
-the manifest limits/grants; remote HTTPS loading requires it. Publisher trust does not grant
-additional host capabilities.
-The loader admits operator-owned regular files with relative component paths and bounded reads;
-it is not a hardened shared writable artifact store. Do not let tenants replace files, directories
-or manifests. There is no unsafe native-AOT deserialization cache in this version.
+Admission, rate buckets, health, sessions, and continuation ownership are process-local.
+Quota-priority overflow is a routing preference; use backend hard limits to cap active work.
+Pinned sessions fail when their backend is unavailable. A deadline cannot undo a dispatched
+side effect. Stream failures after headers terminate the body without changing its status.
+Per-stream pacing is not aggregate bandwidth enforcement.
 
-The example supports independent development tokens and optional managed users with hashed
-random bearer tokens, rotation/revocation, an authenticated admin API, and local persistent rules.
-Management uses a distinct credential, revision preconditions, bounded private files, and one
-process per state file; it is a local control plane rather than a distributed identity store. Never commit them. Do not
-reuse client tokens for an upstream service, accept client-supplied `x-*` identity headers, or grant
-permissions from MCP `clientInfo` or annotations. The reusable identity adapter validates RS256 signatures, issuer/audience/expiry, refreshes bounded
-JWKS, and maps only explicitly trusted claims into permissions. Protected-resource metadata and
-separate upstream OAuth client credentials are available; the gateway is not an authorization server.
+The Python fixture and shared SQLite notes server are development examples. The notes database
+has no per-user ownership or tenant partitioning.
 
-The listener supports TLS/mTLS, connection/HTTP2 admission, handshake/header/I/O deadlines and
-bounded draining. Expired request transports are cancelled even when body polling is backpressured.
-Native callbacks must cooperate with cancellation; use the CPU pool for blocking work.
-The original standard-library Python server is a read-only fixture. The SDK notes server is a
-loopback persistence example; its shared database is not partitioned by tenant. Neither example
-is a hardened production HTTP service.
+## Reporting and release checks
 
-Load-balanced endpoints are operator registered; client metadata cannot select arbitrary URLs.
-MCP sessions pin their backend and fail closed when unavailable. Dispatch is never retried.
-Quota-priority preferences allow overflow, while separate hard backend caps remain enforced.
-Active health probes and single half-open admission are local; shared quota stores are not included.
+No private vulnerability-reporting channel is configured yet. Do not post credentials or exploit
+details in public issues. Configure a private channel before a public release.
 
-Per-stream byte pacing is not aggregate bandwidth enforcement. Per-process limits multiply across
-replicas. Bodies exceeding a limit after response headers are sent terminate the stream. Work with
-side effects requires an explicit idempotency/retry policy; the notes example performs actual writes and the gateway retries no upstream tool calls. Request/response credentials and argument payloads are not logged.
-
-## Release gates
-
-Run formatter, compiler, unit and live gateway tests; run guest trap/state-leak tests; pin and scan
-dependencies; fuzz HTTP/JSON/WIT boundaries; test streaming cancellation, overload, reload and
-worker failure; perform protocol differential tests and security review. Set an actual private
-vulnerability-reporting channel before a public release. Until one is configured, avoid posting
-exploit details or credentials in public issues.
+Release qualification still needs deployment-scale failure testing, dependency scanning,
+coverage-guided fuzzing, protocol differential tests, and independent security review.
