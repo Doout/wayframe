@@ -138,18 +138,6 @@ Use the [graph benchmarks](testing.md#graph-and-routing-costs) to measure the tr
 
 ## Research inputs
 
-These inform scheduling, preparation, and reuse. They do not establish implemented support,
-novelty, or performance in this project.
-
-- [Agent JIT Compilation](https://agent-jit-compilation.github.io/): checked programs,
-  retained semantic decisions, and task-dependent scheduling. Its evaluation targets web applications.
-- [TraceCompiler](https://arxiv.org/abs/2608.02680): workflow extraction with argument provenance.
-  It measures call reduction but claims no net efficiency result.
-- [PASTE](https://arxiv.org/abs/2603.18897): speculative tool calls, isolated results, and
-  joint scheduling with model serving. Our design still needs explicit contracts for external effects.
-- [SpecBox](https://arxiv.org/abs/2607.23933): sandbox prewarming. Our design takeaway is to
-  separate preparation from tool execution.
-- [Ghost Tool Calls](https://arxiv.org/abs/2606.02483): speculative calls can disclose intent
-  when issued, even if their results are discarded.
-- [Salsa](https://github.com/salsa-rs/salsa): dependency-aware reuse of pure query results.
-  Applying reuse to mutable tools requires additional validity and effect contracts.
+The [research note](research.md) records relevant papers, their assumptions, our current
+implementation boundary, and proposed experiments for scheduling, preparation, and reuse.
+Paper results do not establish this project's correctness, novelty, or performance.

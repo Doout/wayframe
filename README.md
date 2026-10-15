@@ -68,6 +68,7 @@ See [testing and benchmarks](docs/testing.md) for the full suite and measurement
 | [Workflows](docs/workflows.md) | Parallel branches, joins, pruning, measured scheduling |
 | [Gateway](docs/gateway.md) | Transports, users, rates, routing, tracing, reloads |
 | [Testing](docs/testing.md) | Verification, overhead comparisons, offered load |
+| [Research](docs/research.md) | Relevant papers, assumptions, proposed experiments |
 
 Workflows, rate buckets, health state, and session ownership are local to one process.
 Wayframe does not provide durable distributed jobs or shared quotas. Native blocks are

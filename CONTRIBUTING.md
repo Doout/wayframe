@@ -17,4 +17,4 @@ overload, and cancellation where relevant. Preserve ownership through streamed r
 Keep credentials and argument payloads out of logs. Document new trust boundaries and
 make plugin ABI or digest changes explicit. See [security](SECURITY.md).
 
-For scheduling, prewarming, and reuse work, consult the [research inputs](docs/workflows.md#research-inputs).
+For scheduling, prewarming, and reuse work, consult the [research inputs](docs/research.md).
