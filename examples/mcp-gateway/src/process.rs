@@ -66,7 +66,7 @@ impl Bridge {
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/mcp", listener.local_addr()?);
-        use rand::RngCore;
+        use rand::Rng;
         let mut bytes = [0u8; 48];
         rand::rng().fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
