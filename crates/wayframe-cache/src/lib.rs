@@ -2,9 +2,12 @@
 use anyhow::{ensure, Result};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+    },
     time::{Duration, Instant},
 };
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -70,15 +73,61 @@ impl Key {
         })
     }
 }
+/// An opaque revision of a retained computation, never an authorization decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dependency {
+    cache_id: u64,
+    key: Key,
+    revision: u64,
+}
+
+/// Exact, application-supplied resource versions. Empty evidence preserves TTL-only reuse.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Evidence(BTreeMap<String, String>);
+impl Evidence {
+    pub fn new(resources: BTreeMap<String, String>) -> Result<Self> {
+        ensure!(
+            !resources.is_empty()
+                && resources.len() <= 64
+                && resources.iter().all(|(key, version)| [key, version]
+                    .iter()
+                    .all(|part| !part.is_empty()
+                        && part.len() <= 256
+                        && !part.chars().any(char::is_control))),
+            "invalid resource evidence"
+        );
+        Ok(Self(resources))
+    }
+    pub fn resources(&self) -> &BTreeMap<String, String> {
+        &self.0
+    }
+    fn bytes(&self) -> usize {
+        self.0.iter().map(|(k, v)| k.len() + v.len()).sum()
+    }
+}
+
+pub struct Retained<T> {
+    pub value: Arc<T>,
+    pub dependency: Dependency,
+}
+
 struct Entry<T> {
     value: Arc<T>,
     until: Instant,
     bytes: usize,
+    evidence: Evidence,
+    dependencies: Vec<Dependency>,
+    revision: u64,
 }
+static NEXT_CACHE: AtomicU64 = AtomicU64::new(1);
 struct State<T> {
+    id: u64,
     entries: HashMap<Key, Entry<T>>,
+    children: HashMap<Key, HashSet<Key>>,
     flights: HashMap<Key, Weak<tokio::sync::Mutex<()>>>,
     bytes: usize,
+    revision: u64,
+    invalidated: u64,
 }
 pub struct Cache<T> {
     state: Mutex<State<T>>,
@@ -96,9 +145,15 @@ impl<T: Send + Sync + 'static> Cache<T> {
         );
         Ok(Self {
             state: Mutex::new(State {
+                id: NEXT_CACHE
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                    .map_err(|_| anyhow::anyhow!("cache identity exhausted"))?,
                 entries: HashMap::new(),
+                children: HashMap::new(),
                 flights: HashMap::new(),
                 bytes: 0,
+                revision: 0,
+                invalidated: 0,
             }),
             maximum,
             maximum_bytes,
@@ -111,47 +166,172 @@ impl<T: Send + Sync + 'static> Cache<T> {
             .lock()
             .map_err(|_| anyhow::anyhow!("cache poisoned"))?;
         Ok(
-            serde_json::json!({"entries":s.entries.len(),"bytes":s.bytes,"flights":s.flights.values().filter(|v|v.strong_count()>0).count()}),
+            serde_json::json!({"entries":s.entries.len(),"bytes":s.bytes,"invalidated":s.invalidated,"dependency_edges":s.children.values().map(HashSet::len).sum::<usize>(),"dependency_parents":s.children.len(),"flights":s.flights.values().filter(|v|v.strong_count()>0).count()}),
         )
+    }
+    /// Removes the computation and every retained descendant, including diamonds.
+    fn remove_branch(s: &mut State<T>, key: &Key) -> usize {
+        let mut pending = vec![key.clone()];
+        let mut removed = 0;
+        while let Some(key) = pending.pop() {
+            if let Some(entry) = s.entries.remove(&key) {
+                s.bytes -= entry.bytes;
+                removed += 1;
+                pending.extend(s.children.remove(&key).unwrap_or_default());
+                for dependency in &entry.dependencies {
+                    if let Some(children) = s.children.get_mut(&dependency.key) {
+                        children.remove(&key);
+                        if children.is_empty() {
+                            s.children.remove(&dependency.key);
+                        }
+                    }
+                }
+            }
+        }
+        s.invalidated = s.invalidated.saturating_add(removed as u64);
+        removed
+    }
+    fn prune(s: &mut State<T>) {
+        let now = Instant::now();
+        let expired: Vec<_> = s
+            .entries
+            .iter()
+            .filter(|(_, e)| e.until <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            Self::remove_branch(s, &key);
+        }
+    }
+    fn current(s: &State<T>, dependencies: &[Dependency]) -> bool {
+        let mut pending: Vec<_> = dependencies.iter().collect();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(dep) = pending.pop() {
+            if dep.cache_id != s.id {
+                return false;
+            }
+            let Some(entry) = s.entries.get(&dep.key) else {
+                return false;
+            };
+            if entry.revision != dep.revision || entry.until <= Instant::now() {
+                return false;
+            }
+            if seen.insert(&dep.key) {
+                pending.extend(entry.dependencies.iter());
+            }
+        }
+        true
+    }
+    pub fn invalidate(&self, key: &Key) -> Result<usize> {
+        let mut s = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cache poisoned"))?;
+        Ok(Self::remove_branch(&mut s, key))
     }
     pub fn get(&self, key: &Key) -> Result<Option<Arc<T>>> {
         let mut s = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("cache poisoned"))?;
-        if s.entries
-            .get(key)
-            .is_some_and(|e| e.until <= Instant::now())
-        {
-            if let Some(e) = s.entries.remove(key) {
-                s.bytes -= e.bytes;
-            }
+        if s.entries.get(key).is_some_and(|entry| {
+            entry.until <= Instant::now()
+                || !entry.evidence.0.is_empty()
+                || !entry.dependencies.is_empty()
+        }) {
+            Self::remove_branch(&mut s, key);
         }
-        Ok(s.entries.get(key).map(|e| e.value.clone()))
+        Ok(s.entries.get(key).map(|entry| entry.value.clone()))
     }
-    pub fn insert(&self, key: Key, value: T, bytes: usize, ttl: Duration) -> Result<Arc<T>> {
-        ensure!(
-            !ttl.is_zero() && ttl <= Duration::from_secs(3600) && bytes <= self.maximum_bytes,
-            "invalid cache entry"
-        );
+    /// Caller must obtain fresh evidence under its own consistency and permission contract.
+    /// This checks exact versions and parent revisions atomically with the cache lookup.
+    pub fn lookup(
+        &self,
+        key: &Key,
+        dependencies: &[Dependency],
+        evidence: &Evidence,
+    ) -> Result<Option<Retained<T>>> {
         let mut s = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("cache poisoned"))?;
-        let now = Instant::now();
-        let mut removed = 0;
-        s.entries.retain(|_, e| {
-            if e.until <= now {
-                removed += e.bytes;
-                false
-            } else {
-                true
-            }
-        });
-        s.bytes -= removed;
-        if let Some(old) = s.entries.remove(&key) {
-            s.bytes -= old.bytes;
+        if s.entries
+            .get(key)
+            .is_some_and(|entry| entry.until <= Instant::now())
+        {
+            Self::remove_branch(&mut s, key);
         }
+        if s.entries.get(key).is_some_and(|e| {
+            e.evidence != *evidence
+                || e.dependencies != dependencies
+                || !Self::current(&s, dependencies)
+        }) {
+            Self::remove_branch(&mut s, key);
+        }
+        Ok(s.entries.get(key).map(|entry| Retained {
+            value: entry.value.clone(),
+            dependency: Dependency {
+                cache_id: s.id,
+                key: key.clone(),
+                revision: entry.revision,
+            },
+        }))
+    }
+    pub fn insert(&self, key: Key, value: T, bytes: usize, ttl: Duration) -> Result<Arc<T>> {
+        Ok(self
+            .retain(key, value, bytes, ttl, &[], Evidence::default())?
+            .value)
+    }
+    /// Rejects stale parent receipts, including a parent invalidated while work ran.
+    pub fn retain(
+        &self,
+        key: Key,
+        value: T,
+        bytes: usize,
+        ttl: Duration,
+        dependencies: &[Dependency],
+        evidence: Evidence,
+    ) -> Result<Retained<T>> {
+        ensure!(
+            !ttl.is_zero() && ttl <= Duration::from_secs(3600) && dependencies.len() <= 64,
+            "invalid cache entry"
+        );
+        ensure!(
+            dependencies.iter().all(|dep| dep.key != key
+                && dep.key.tenant == key.tenant
+                && dep.key.subject == key.subject
+                && dep.key.permissions == key.permissions
+                && dep.key.generation == key.generation),
+            "foreign or cyclic dependency"
+        );
+        let key_bytes = |key: &Key| {
+            key.tenant.len()
+                + key.subject.len()
+                + key.permissions.len()
+                + key.route.len()
+                + key.operation.len()
+                + key.target.len()
+                + key.arguments.len()
+                + 8
+        };
+        let bytes = bytes
+            .saturating_add(key_bytes(&key).saturating_mul(2))
+            .saturating_add(evidence.bytes())
+            .saturating_add(
+                dependencies
+                    .iter()
+                    .map(|d| 2 * key_bytes(&d.key) + key_bytes(&key) + 16)
+                    .sum::<usize>(),
+            );
+        ensure!(bytes <= self.maximum_bytes, "cache byte capacity");
+        let mut s = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cache poisoned"))?;
+        Self::prune(&mut s);
+        ensure!(Self::current(&s, dependencies), "stale cache dependency");
+        // Replacing a parent invalidates its previous descendants even if its value is equal.
+        Self::remove_branch(&mut s, &key);
         while !s.entries.is_empty()
             && (s.entries.len() >= self.maximum
                 || s.bytes.saturating_add(bytes) > self.maximum_bytes)
@@ -162,41 +342,59 @@ impl<T: Send + Sync + 'static> Cache<T> {
                 .min_by_key(|(_, e)| e.until)
                 .map(|(k, _)| k.clone())
                 .expect("nonempty");
-            if let Some(old) = s.entries.remove(&oldest) {
-                s.bytes -= old.bytes;
-            }
+            Self::remove_branch(&mut s, &oldest);
         }
         ensure!(
-            s.bytes.saturating_add(bytes) <= self.maximum_bytes,
-            "cache byte capacity"
+            Self::current(&s, dependencies),
+            "dependency evicted during admission"
         );
+        s.revision = s
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("cache revision exhausted"))?;
+        let revision = s.revision;
         let value = Arc::new(value);
         s.bytes += bytes;
+        for dependency in dependencies {
+            s.children
+                .entry(dependency.key.clone())
+                .or_default()
+                .insert(key.clone());
+        }
         s.entries.insert(
-            key,
+            key.clone(),
             Entry {
                 value: value.clone(),
-                until: now + ttl,
+                until: Instant::now() + ttl,
                 bytes,
+                evidence,
+                dependencies: dependencies.to_vec(),
+                revision,
             },
         );
-        Ok(value)
+        Ok(Retained {
+            value,
+            dependency: Dependency {
+                cache_id: s.id,
+                key,
+                revision,
+            },
+        })
     }
     pub fn invalidate_generation(&self, generation: u64) -> Result<()> {
         let mut s = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("cache poisoned"))?;
-        let mut removed = 0;
-        s.entries.retain(|key, e| {
-            if key.generation != generation {
-                removed += e.bytes;
-                false
-            } else {
-                true
-            }
-        });
-        s.bytes -= removed;
+        let keys: Vec<_> = s
+            .entries
+            .keys()
+            .filter(|key| key.generation != generation)
+            .cloned()
+            .collect();
+        for key in keys {
+            Self::remove_branch(&mut s, &key);
+        }
         Ok(())
     }
     pub async fn singleflight(

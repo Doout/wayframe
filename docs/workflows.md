@@ -67,6 +67,29 @@ rejects old plans and ports. `FlowBlock::with_plan` embeds a prepared selection
 without removing mandatory gates.
 See the [prepared-plan tests](../crates/wayframe-flow/tests/plans.rs).
 
+## Retaining computation results
+
+`wayframe-cache` provides explicit dependency receipts alongside its scoped TTL cache.
+Applications supply resource evidence and decide which computations may be retained; graph
+execution does not infer either from traces or automatically retain node outputs.
+
+Use `Cache::retain` with a scoped `Key`, payload size, TTL, parent `Dependency` receipts,
+and an `Evidence` map. It returns an `Arc` value and an opaque computation receipt.
+`Cache::lookup` requires the same ordered direct parent receipts and freshly obtained evidence.
+It checks ancestor receipts and expiry under the cache lock. Changed evidence, replacement,
+expiry, eviction, or explicit `invalidate` removes retained descendants. A replacement gets a
+new receipt even when its value is unchanged; a late child cannot retain against the old one.
+Foreign cache, identity, or generation dependencies fail. The ordinary `get` method cannot return an
+entry protected by evidence or parent dependencies.
+
+Keep authorization and the original deadline outside retained values. Evidence is an exact
+comparison of application-provided observations, not proof that an external resource is
+immutable or that several remote reads form a transaction. Bound evidence acquisition and
+check again before publishing results under the application's consistency contract.
+Keys, evidence, and receipts count toward the byte budget. See the
+[dependency tests](../crates/wayframe-cache/tests/dependencies.rs) and
+[cache benchmarks](testing.md#dependency-cache-costs).
+
 ## Ordering slow work
 
 `Priority::Stable` preserves creation order among ready nodes. `CriticalPath` uses `cost_hint`
