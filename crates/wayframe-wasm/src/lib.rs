@@ -781,7 +781,7 @@ mod failure_tests {
     #[test]
     fn publisher_signature_binds_digest_limits_version_and_grants() {
         use ed25519_dalek::{Signer, SigningKey};
-        use rand::RngCore;
+        use rand::Rng;
         let mut secret = [0u8; 32];
         rand::rng().fill_bytes(&mut secret);
         let signer = SigningKey::from_bytes(&secret);
