@@ -1,13 +1,16 @@
 //! Per-invocation execution selection at a declared phase boundary. No partial work is replayed.
+mod profile;
 use crate::Pipeline;
+pub use profile::{ProfileError, ProfileSettings, ProfileStatistics, Workload};
 use std::{
+    panic::AssertUnwindSafe,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::Instant,
 };
-use wayframe_core::{Block, Context, Decision, Execution, Phase, PlanError};
+use wayframe_core::{Block, Context, Decision, Execution, Phase, PlanError, Reason};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Path {
@@ -20,6 +23,10 @@ pub enum SelectionReason {
     ParallelWork,
     ExplicitRule,
     AdmissionPressure,
+    ProfileWarmup,
+    ProfileExplore,
+    ProfileBudget,
+    MeasuredCost,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Selection {
@@ -48,6 +55,11 @@ pub struct Statistics {
     pub graph: u64,
 }
 type Selector<C> = Arc<dyn Fn(&C) -> Selection + Send + Sync>;
+type Classifier<C> = Arc<dyn Fn(&C) -> Workload + Send + Sync>;
+struct Learning<C> {
+    classify: Classifier<C>,
+    profile: profile::Profile,
+}
 
 /// Both paths must implement the same required controls. Shared gates belong outside this block.
 /// Selection happens when execution reaches this boundary, using the context produced so far.
@@ -59,6 +71,7 @@ pub struct Adaptive<C: Context> {
     select: Selector<C>,
     linear_count: AtomicU64,
     graph_count: AtomicU64,
+    learning: Option<Learning<C>>,
 }
 impl<C: Context> Adaptive<C> {
     pub fn new(
@@ -88,7 +101,25 @@ impl<C: Context> Adaptive<C> {
             select: Arc::new(select),
             linear_count: AtomicU64::new(0),
             graph_count: AtomicU64::new(0),
+            learning: None,
         })
+    }
+    /// Only choose between equivalent prepared paths; measurements never replace required controls.
+    pub fn with_profile(
+        mut self,
+        classify: impl Fn(&C) -> Workload + Send + Sync + 'static,
+        settings: ProfileSettings,
+    ) -> Result<Self, ProfileError> {
+        self.learning = Some(Learning {
+            classify: Arc::new(classify),
+            profile: profile::Profile::new(settings)?,
+        });
+        Ok(self)
+    }
+    pub fn profile_statistics(&self) -> Option<ProfileStatistics> {
+        self.learning
+            .as_ref()
+            .map(|learning| learning.profile.statistics())
     }
     pub fn statistics(&self) -> Statistics {
         Statistics {
@@ -110,11 +141,36 @@ impl<C: Context> Block<C> for Adaptive<C> {
             return Execution::Immediate(Decision::expired());
         }
         #[cfg(feature = "tracing")]
-        let selection_span = tracing::info_span!("workflow.select", block.id = %self.id, execution.path = tracing::field::Empty, selection.reason = tracing::field::Empty);
+        let selection_span = tracing::info_span!("workflow.select", block.id = %self.id, execution.path = tracing::field::Empty, selection.reason = tracing::field::Empty, selection.outcome = tracing::field::Empty);
+        let choose = || {
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let fallback = (self.select)(context);
+                match &self.learning {
+                    Some(learning) => learning.profile.choose(
+                        (learning.classify)(context),
+                        fallback,
+                        deadline.saturating_duration_since(Instant::now()),
+                        Instant::now(),
+                    ),
+                    None => Ok((fallback, None)),
+                }
+            }))
+        };
         #[cfg(feature = "tracing")]
-        let selection = selection_span.in_scope(|| (self.select)(context));
+        let selected = selection_span.in_scope(choose);
         #[cfg(not(feature = "tracing"))]
-        let selection = (self.select)(context);
+        let selected = choose();
+        let (selection, ticket) = match selected {
+            Ok(Ok(selected)) => selected,
+            _ => {
+                #[cfg(feature = "tracing")]
+                selection_span.record("selection.outcome", "failed");
+                return Execution::Immediate(Decision::deny(
+                    Reason::Internal,
+                    "workflow_selection_failed",
+                ));
+            }
+        };
         #[cfg(feature = "tracing")]
         {
             selection_span.record(
@@ -125,6 +181,7 @@ impl<C: Context> Block<C> for Adaptive<C> {
                 },
             );
             selection_span.record("selection.reason", tracing::field::debug(selection.reason));
+            selection_span.record("selection.outcome", "selected");
             drop(selection_span);
         }
         if Instant::now() >= deadline {
@@ -139,6 +196,7 @@ impl<C: Context> Block<C> for Adaptive<C> {
             }
         }
         Execution::Deferred(Box::pin(async move {
+            let started = Instant::now();
             let work = async {
                 if Instant::now() >= deadline {
                     return Decision::expired();
@@ -154,10 +212,19 @@ impl<C: Context> Block<C> for Adaptive<C> {
                 work.instrument(tracing::info_span!("workflow.path", execution.path = match selection.path { Path::Linear => "linear", Path::Graph => "graph" }, selection.reason = ?selection.reason))
             };
             // A selected path cannot extend the shared request deadline, or trigger fallback/replay.
-            match tokio::time::timeout_at(deadline.into(), work).await {
+            let result = match tokio::time::timeout_at(deadline.into(), work).await {
                 Ok(decision) if Instant::now() < deadline => decision,
                 _ => Decision::expired(),
+            };
+            if let (Some(learning), Some(ticket)) = (&self.learning, ticket) {
+                learning.profile.observe(
+                    ticket,
+                    started.elapsed(),
+                    result == Decision::Continue,
+                    Instant::now(),
+                );
             }
+            result
         }))
     }
 }

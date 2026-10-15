@@ -39,13 +39,6 @@ impl MatchedPolicy {
                         .is_some_and(|t| self.targets.contains(t)))
         })
     }
-    async fn decide(&self, ctx: &RequestContext) -> Decision {
-        if self.applies(ctx) {
-            self.external.decide(ctx).await
-        } else {
-            Decision::Continue
-        }
-    }
 }
 impl Block<RequestContext> for MatchedPolicy {
     fn id(&self) -> &str {
@@ -224,11 +217,17 @@ pub(crate) async fn prepare_deployment(
             config.async_policies.len() <= 16,
             "too many external policies"
         );
-        let mut graph = wayframe::flow::Builder::<RequestContext>::new();
+        let mut graph = wayframe::flow::Builder::<RequestContext>::new()
+            .priority(config.async_priority.priority())
+            .limits(wayframe::flow::Limits {
+                max_parallel: config.async_max_parallel,
+                max_executions: 128,
+                max_running_nodes: 256,
+            });
         let root = graph.input();
         let mut gates = Vec::new();
         let mut checks = Vec::new();
-        for control in &config.async_policies {
+        for (index, control) in config.async_policies.iter().enumerate() {
             let token = config::secret(&control.token_env)?;
             let ca = control
                 .ca
@@ -258,21 +257,52 @@ pub(crate) async fn prepare_deployment(
                 targets: control.targets.clone(),
             });
             checks.push(matched.clone());
-            gates.push(graph.gate_async(
-                control.id.clone(),
+            let selection = matched.clone();
+            let applies = graph.sync(
+                format!("policy-{index}-match"),
                 Phase::Authorize,
                 &root,
-                move |ctx| {
+                move |ctx| Ok(selection.applies(&ctx)),
+            )?;
+            let call =
+                graph.asynchronous(control.id.clone(), Phase::Authorize, &root, move |ctx| {
                     let matched = matched.clone();
-                    async move { matched.decide(&ctx).await }
-                },
+                    async move { Ok(matched.external.decide(&ctx).await) }
+                })?;
+            graph.when(&call, &applies, true)?;
+            graph.cost_hint(
+                &call,
+                std::time::Duration::from_millis(control.estimated_ms),
+            )?;
+            let inactive = graph.sync(
+                format!("policy-{index}-inactive"),
+                Phase::Authorize,
+                &root,
+                |_| Ok(Decision::Continue),
+            )?;
+            graph.when(&inactive, &applies, false)?;
+            let result = graph.choice(
+                format!("policy-{index}-result"),
+                Phase::Authorize,
+                &call,
+                &inactive,
+            )?;
+            // Applicability can remove optional work, but the policy gate must still succeed.
+            gates.push(graph.gate(
+                format!("policy-{index}-gate"),
+                Phase::Authorize,
+                &result,
+                |decision| decision.clone(),
             )?);
         }
         let joined = graph.sync("policy-join", Phase::Authorize, &root, |_| Ok(()))?;
         for gate in &gates {
             graph.depends_on(&joined, gate)?;
         }
+        // Flow completion already waits for every mandatory gate; this unused value is discardable.
+        graph.discardable(&joined)?;
         let graph = graph.compile()?;
+        let prepared = graph.prepare(&[])?;
         let linear = Pipeline::compile(
             checks
                 .iter()
@@ -280,21 +310,25 @@ pub(crate) async fn prepare_deployment(
                 .map(|c| c as Arc<dyn Block<RequestContext>>)
                 .collect(),
         )?;
-        let parallel = Arc::new(wayframe::http::workflow::FlowBlock::new(
-            "parallel-policies",
-            Phase::Authorize,
-            graph,
-            |ctx| {
-                let mut view = ctx.clone();
-                view.body = None;
-                view.headers = axum::http::HeaderMap::new();
-                view.extensions = Default::default();
-                view
-            },
-            |_, _| Decision::Continue,
-        ));
+        let parallel = Arc::new(
+            wayframe::http::workflow::FlowBlock::new(
+                "parallel-policies",
+                Phase::Authorize,
+                graph,
+                |ctx| {
+                    let mut view = ctx.clone();
+                    view.body = None;
+                    view.headers = axum::http::HeaderMap::new();
+                    view.extensions = Default::default();
+                    view
+                },
+                |_, _| Decision::Continue,
+            )
+            .with_plan(prepared)?,
+        );
         let threshold = config.async_parallel_threshold;
-        let selected = Arc::new(wayframe::adaptive::Adaptive::new(
+        let classifier = checks.clone();
+        let selected = wayframe::adaptive::Adaptive::new(
             "adaptive-policies",
             Phase::Authorize,
             linear,
@@ -305,7 +339,27 @@ pub(crate) async fn prepare_deployment(
                     threshold,
                 )
             },
-        )?);
+        )?;
+        let selected = if let Some(profile) = &config.async_profile {
+            selected.with_profile(
+                move |ctx: &RequestContext| {
+                    let key = classifier
+                        .iter()
+                        .enumerate()
+                        .fold(0u64, |mask, (i, policy)| {
+                            mask | (u64::from(policy.applies(ctx)) << i)
+                        });
+                    wayframe::adaptive::Workload {
+                        key,
+                        width: key.count_ones() as usize,
+                    }
+                },
+                profile.settings()?,
+            )?
+        } else {
+            selected
+        };
+        let selected = Arc::new(selected);
         policy.push(selected.clone());
         adaptive = Some(selected);
     }

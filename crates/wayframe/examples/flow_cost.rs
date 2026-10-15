@@ -45,6 +45,66 @@ impl Block<Work> for Noop {
         Execution::Immediate(Decision::Continue)
     }
 }
+async fn branching_cost(count: usize, nodes: usize, selected: bool) -> serde_json::Value {
+    let mut builder = Builder::<Work>::new();
+    let root = builder.input();
+    let fact = builder
+        .sync("fact", Phase::Authorize, &root, |ctx| Ok(ctx.width > 0))
+        .unwrap();
+    let mut tail = builder
+        .sync("optional", Phase::Authorize, &root, |_| Ok(0u64))
+        .unwrap();
+    builder.when(&tail, &fact, true).unwrap();
+    for i in 1..nodes {
+        tail = builder
+            .sync(format!("optional-{i}"), Phase::Authorize, &tail, |value| {
+                Ok(*value + 1)
+            })
+            .unwrap();
+    }
+    let otherwise = builder
+        .sync("otherwise", Phase::Authorize, &root, |_| Ok(0u64))
+        .unwrap();
+    builder.when(&otherwise, &fact, false).unwrap();
+    let joined = builder
+        .choice("choice", Phase::Authorize, &tail, &otherwise)
+        .unwrap();
+    let output = builder
+        .sync("after", Phase::Authorize, &joined, |value| Ok(*value + 1))
+        .unwrap();
+    let flow = builder.compile().unwrap();
+    let ctx = Arc::new(Work {
+        deadline: Instant::now() + Duration::from_secs(300),
+        width: usize::from(selected),
+    });
+    let mut batches = Vec::new();
+    let mut pruned = 0;
+    // Warm compilation, allocation and executor paths before timing.
+    for _ in 0..100 {
+        black_box(flow.run(ctx.clone()).await.unwrap());
+    }
+    for _ in 0..7 {
+        let start = Instant::now();
+        for _ in 0..count {
+            let run = flow.run(ctx.clone()).await.unwrap();
+            assert_eq!(
+                run.get(&output),
+                Some(&if selected { nodes as u64 } else { 1 })
+            );
+            black_box(run);
+        }
+        batches.push(start.elapsed().as_nanos() as f64 / count as f64);
+    }
+    let run = flow.run(ctx).await.unwrap();
+    for node in &run.nodes {
+        pruned += usize::from(node.state == wayframe::flow::State::Skipped);
+    }
+    let mut ordered = batches.clone();
+    ordered.sort_by(f64::total_cmp);
+    serde_json::json!({"optional_nodes":nodes,"optional_path_selected":selected,
+        "median_ns":ordered[3],"batches_ns":batches,"pruned_nodes":pruned,
+        "executed_nodes":run.nodes.iter().filter(|n| n.state == wayframe::flow::State::Succeeded).count()-1})
+}
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let count = std::env::var("WAYFRAME_FLOW_RUNS")
@@ -123,9 +183,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ag.sort_by(f64::total_cmp);
         cases.push(serde_json::json!({"nodes":nodes,"linear_ns":l[3],"graph_ns":g[3],"incremental_ns":g[3]-l[3],"linear_batches_ns":linear,"graph_batches_ns":graph,"adaptive_linear_ns":al[3],"adaptive_graph_ns":ag[3],"adaptive_linear_batches_ns":adaptive_linear,"adaptive_graph_batches_ns":adaptive_graph}));
     }
+    let mut branches = Vec::new();
+    for nodes in [1, 16, 64, 128] {
+        for selected in [false, true] {
+            branches.push(branching_cost(count, nodes, selected).await);
+        }
+    }
     println!(
         "{}",
-        serde_json::json!({"iterations_per_batch":count,"batches":7,"cases":cases,"scope":"warm graph scheduling; no network or plugin execution"})
+        serde_json::json!({"iterations_per_batch":count,"batches":7,"cases":cases,"branch_cases":branches,"scope":"warm graph scheduling and conditional specialization; no network or plugin execution; tracing disabled"})
     );
     Ok(())
 }

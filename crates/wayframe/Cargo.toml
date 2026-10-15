@@ -74,5 +74,9 @@ name = "flow_cost"
 required-features = ["flow"]
 
 [[example]]
+name = "flow_delays"
+required-features = ["flow"]
+
+[[example]]
 name = "boundary_fuzz"
 required-features = ["mcp", "codec"]
