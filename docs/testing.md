@@ -107,3 +107,19 @@ cargo run --locked --release -p wayframe --no-default-features --features lb \
 parallelism. Reports include starts, waits, and observed costs. `lb_cost` checks selection totals
 and final lease release. These isolate local execution costs; use the full gateway workload for
 network latency and capacity measurements.
+
+## Dependency cache costs
+
+```bash
+cargo test --locked -p wayframe-cache
+cargo run --locked --release -p wayframe-cache --example cache_cost
+cargo run --locked --release -p wayframe-cache --example dependency_cost
+```
+
+The first example measures TTL lookup in 30 batches of 10,000 operations. Its source also
+runs against the pre-change cache at `fd5efd8`. Copy it into a separate checkout and use a
+separate `CARGO_TARGET_DIR` when comparing binaries. The second measures dependency lookup
+through a diamond, invalidating its four nodes, and invalidating a 512-entry fan-out.
+Both print raw JSON; CI uploads current results with verification reports. These exclude
+remote evidence acquisition and application work. Single invalidation timings are descriptive,
+not latency percentiles.

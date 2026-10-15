@@ -42,6 +42,10 @@ jobs:
       - name: Check benchmark harness
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/benchmark.sh --requests 100 --rounds 1 --concurrency 1 --payloads 64 --formats json --native-only --skip-boundaries
+      - name: Dependency cache benchmark
+        run: |
+          cargo run --locked --release -p wayframe-cache --example cache_cost > target/verification/cache-cost.json
+          cargo run --locked --release -p wayframe-cache --example dependency_cost > target/verification/dependency-cost.json
       - name: Upload verification reports
         if: always()
         uses: actions/upload-artifact@v7

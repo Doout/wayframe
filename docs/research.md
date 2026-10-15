@@ -62,15 +62,19 @@ bounded speculation against the same resource budget.
 
 [Wayframe](workflows.md) provides authored graphs, pruning, prepared structural plans,
 and scheduling policies. Prepared plans retain neither results nor authorization.
+Its cache separately supports exact evidence and dependency receipts for descendant invalidation.
 [Waypilot](https://github.com/Doout/waypilot/blob/main/docs/gateway.md#workflows-reuse-and-prewarming)
-provides configured MCP workflows, explicit per-tool TTL reuse, and initialization/catalog
-prewarming. It does not yet mine workflows, speculatively invoke tools, validate remote
-resource versions, or retain arbitrary whole-branch executions. TTL limits staleness;
-it cannot discover an external update. Initialization itself remains observable remotely.
+provides configured MCP workflows, per-tool reuse, and initialization/catalog prewarming.
+Cooperative upstreams can opt into state-v1 version validation and dependency-aware branch
+invalidation. This checks observations at validation points; it does not provide a distributed
+snapshot or rollback. TTL-only reuse cannot discover external updates. Trace mining,
+speculative tool invocation, and retaining arbitrary whole-branch executions remain absent.
+Initialization itself remains observable remotely.
 
 ## Tests that should decide the next step
 
-These are proposed local MCP experiments, not completed validation or paper results.
+These are decision criteria. Local state-validation coverage and measurements belong in
+the testing guides; they do not reproduce the papers or establish arbitrary-server support.
 
 | Question | Experiment | Evidence required |
 | --- | --- | --- |
