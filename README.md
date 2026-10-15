@@ -7,6 +7,10 @@ protocol, policy blocks, listeners, and deployment model. A dependency-free core
 blocks and linear plans. Optional crates add typed async graphs, plugin factories, HTTP forwarding,
 identity and administration, routing, resilience, caching, MCP inspection, and sandboxed Wasm policies.
 Prepared adaptive boundaries choose linear or graph execution per request as work becomes known.
+Typed graph selectors prune inactive branches as facts arrive, then rejoin synchronous or async work.
+Prepared output plans can omit explicitly discardable work. Optional cost-aware scheduling learns
+slow nodes and starts ready critical paths earlier; measured adaptive selection compares equivalent
+linear and graph paths while keeping request controls and deadlines.
 
 This is an early alpha. See [security boundaries](SECURITY.md) before deploying it.
 
@@ -245,6 +249,21 @@ mkdir -p target/benchmarks
 cargo run --locked --release -p wayframe --no-default-features --features flow \
   --example flow_cost > target/benchmarks/flow-cost.json
 ```
+
+The report includes seven batches for selected and pruned optional branches, with executed/pruned
+node counts. These warm no-op timings isolate scheduling cost with tracing disabled.
+
+To exercise actual delayed nodes, limited parallelism and learned ordering:
+
+```bash
+cargo run --locked --release -p wayframe --no-default-features --features flow \
+  --example flow_delays > target/benchmarks/flow-delays.json
+```
+
+This runs one/several slow jobs and an unused slow job at 1/2/4 parallel slots. It compares stable,
+critical-path and measured ordering, reports cold/warm timings, and includes node starts, waits,
+execution modes and observed costs. Delays use real timers to simulate I/O. Deterministic tests also
+prove an 85 ms deadline passes with critical-path order where creation order expires.
 
 `--skip-boundaries` omits the four microbenchmark reports. To isolate native load balancing
 without other facade features:

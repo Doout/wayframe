@@ -14,6 +14,125 @@ struct Work {
     deadline: Instant,
     width: usize,
 }
+
+struct Timed {
+    id: &'static str,
+    delay: Duration,
+    calls: Arc<AtomicUsize>,
+    denied: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Block<Work> for Timed {
+    fn id(&self) -> &str {
+        self.id
+    }
+    fn phase(&self) -> Phase {
+        Phase::Authorize
+    }
+    fn execute<'a>(&'a self, _: &'a mut Work) -> Execution<'a> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.denied.load(Ordering::SeqCst) {
+            return Execution::Immediate(Decision::deny(Reason::Forbidden, "current_rule"));
+        }
+        Execution::Deferred(Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            Decision::Continue
+        }))
+    }
+}
+#[tokio::test]
+async fn learned_path_selection_keeps_current_denials_and_never_replays() {
+    use wayframe_runtime::adaptive::{ProfileSettings, Workload};
+    let linear = Arc::new(AtomicUsize::new(0));
+    let graph = Arc::new(AtomicUsize::new(0));
+    let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let selected = Adaptive::new(
+        "measured",
+        Phase::Authorize,
+        Pipeline::compile(vec![Arc::new(Timed {
+            id: "linear",
+            delay: Duration::from_millis(12),
+            calls: linear.clone(),
+            denied: denied.clone(),
+        })])
+        .unwrap(),
+        Arc::new(Timed {
+            id: "graph",
+            delay: Duration::from_millis(1),
+            calls: graph.clone(),
+            denied: denied.clone(),
+        }),
+        |c: &Work| Selection::for_width(c.width, 2),
+    )
+    .unwrap()
+    .with_profile(
+        |c: &Work| Workload {
+            key: c.width as u64,
+            width: c.width,
+        },
+        ProfileSettings {
+            min_samples: 2,
+            ..ProfileSettings::default()
+        },
+    )
+    .unwrap();
+    for _ in 0..4 {
+        assert_eq!(
+            selected.execute(&mut work(2)).resolve().await,
+            Decision::Continue
+        );
+    }
+    assert_eq!(linear.load(Ordering::SeqCst), 2);
+    assert_eq!(graph.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        selected.execute(&mut work(2)).resolve().await,
+        Decision::Continue
+    );
+    assert_eq!(linear.load(Ordering::SeqCst), 2);
+    assert_eq!(graph.load(Ordering::SeqCst), 3);
+    denied.store(true, Ordering::SeqCst);
+    assert_eq!(
+        selected.execute(&mut work(2)).resolve().await,
+        Decision::deny(Reason::Forbidden, "current_rule")
+    );
+    assert_eq!(linear.load(Ordering::SeqCst), 2);
+    assert_eq!(graph.load(Ordering::SeqCst), 4);
+    let stats = selected.profile_statistics().unwrap();
+    assert_eq!(stats.successes, 5);
+    assert_eq!(stats.failures, 1);
+}
+#[tokio::test]
+async fn a_panicking_selector_or_classifier_fails_closed_before_either_path() {
+    use wayframe_runtime::adaptive::{ProfileSettings, Workload};
+    let calls = Arc::new(AtomicUsize::new(0));
+    for classifier in [false, true] {
+        let selected = Adaptive::new(
+            "panic",
+            Phase::Authorize,
+            Pipeline::compile(vec![step("linear", Phase::Authorize, calls.clone(), false)])
+                .unwrap(),
+            step("graph", Phase::Authorize, calls.clone(), false),
+            move |_: &Work| {
+                if !classifier {
+                    panic!("selector");
+                }
+                Selection::for_width(2, 2)
+            },
+        )
+        .unwrap()
+        .with_profile(
+            move |_: &Work| -> Workload {
+                panic!("classifier");
+            },
+            ProfileSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.execute(&mut work(2)).resolve().await,
+            Decision::deny(Reason::Internal, "workflow_selection_failed")
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
 impl Context for Work {
     fn deadline(&self) -> Instant {
         self.deadline

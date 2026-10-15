@@ -1,5 +1,11 @@
 //! Bounded typed DAG execution. Each node owns its output; joins never merge mutable contexts.
-use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
+mod plans;
+mod priority;
+pub use priority::{NodeCost, Priority};
+mod schedule;
+use futures_util::{stream::FuturesUnordered, StreamExt};
+pub use plans::{CacheStatistics, Output, Prepared};
+use schedule::{accept, Arguments, NodeSet, NodeTimer, Schedule, Step};
 use std::{
     any::{Any, TypeId},
     collections::HashSet,
@@ -8,7 +14,7 @@ use std::{
     marker::PhantomData,
     panic::AssertUnwindSafe,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -18,9 +24,32 @@ use tokio::{
 use tracing::Instrument;
 use wayframe_core::{Context, Decision, Phase, Reason, Task};
 type Value = Arc<dyn Any + Send + Sync>;
-type Action = Arc<dyn Fn(Vec<Option<Value>>) -> Task<Value, Error> + Send + Sync>;
-type Running =
-    Pin<Box<dyn Future<Output = (usize, Duration, Duration, Result<Value, Error>)> + Send>>;
+type Invoke = Arc<dyn Fn(&[Option<Value>]) -> Task<Value, Error> + Send + Sync>;
+#[derive(Clone)]
+struct Action {
+    invoke: Invoke,
+    immediate: bool,
+}
+impl Action {
+    fn immediate(
+        f: impl Fn(&[Option<Value>]) -> Task<Value, Error> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            invoke: Arc::new(f),
+            immediate: true,
+        }
+    }
+    fn deferred(
+        f: impl Fn(&[Option<Value>]) -> Task<Value, Error> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            invoke: Arc::new(f),
+            immediate: false,
+        }
+    }
+}
+type Completed = (usize, Duration, Duration, Result<Value, Error>);
+type Running = Pin<Box<dyn Future<Output = Completed> + Send>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -86,6 +115,21 @@ pub struct NodeReport {
     pub scheduler_wait: Duration,
     /// Time executing after scheduler admission.
     pub elapsed: Duration,
+    /// Why the node was removed from this invocation's executable graph.
+    pub skip_reason: Option<SkipReason>,
+    pub scheduling: Option<Scheduling>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheduling {
+    Inline,
+    Serial,
+    Parallel,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    BranchNotSelected,
+    DependencySkipped,
+    UnrequestedOutput,
 }
 pub struct Run {
     scope: Arc<()>,
@@ -154,22 +198,42 @@ struct Node {
     input_types: Vec<TypeId>,
     output: TypeId,
     action: Action,
-    condition: Option<(usize, bool)>,
+    dependencies: String,
+    condition: Option<Condition>,
     kind: Kind,
     budget: Option<Duration>,
+    discardable: bool,
+    cost_hint: Duration,
+    observed: priority::Observed,
+}
+struct Condition {
+    dependency: usize,
+    matches: Arc<dyn Fn(&Value) -> bool + Send + Sync>,
+}
+/// Immutable indexes prepared once per graph generation. No executable code is generated.
+struct Topology {
+    dependents: Vec<Vec<usize>>,
+    guarded: Vec<Vec<usize>>,
+    gates: Vec<usize>,
+    scores: Vec<u64>,
+    has_budgets: bool,
 }
 pub struct Builder<C> {
     scope: Arc<()>,
     nodes: Vec<Node>,
     limits: Limits,
+    priority: Priority,
     marker: PhantomData<fn() -> C>,
 }
 pub struct Flow<C> {
     scope: Arc<()>,
     nodes: Arc<Vec<Node>>,
+    topology: Topology,
     limits: Limits,
     admission: Arc<Semaphore>,
     running: Arc<Semaphore>,
+    plan_cache: Mutex<plans::Cache>,
+    priority: Priority,
     marker: PhantomData<fn() -> C>,
 }
 fn input<T: Send + Sync + 'static>(inputs: &[Option<Value>], i: usize) -> Arc<T> {
@@ -188,15 +252,22 @@ impl<C: Context + Sync> Builder<C> {
             deps: vec![],
             input_types: vec![],
             output: TypeId::of::<C>(),
-            action: Arc::new(|_| Task::Immediate(Err(Error::Failed("input_not_executable")))),
+            action: Action::immediate(|_| {
+                Task::Immediate(Err(Error::Failed("input_not_executable")))
+            }),
+            dependencies: String::new(),
             condition: None,
             kind: Kind::Work,
             budget: None,
+            discardable: false,
+            cost_hint: Duration::ZERO,
+            observed: priority::Observed::default(),
         };
         Self {
             scope: Arc::new(()),
             nodes: vec![root],
             limits: Limits::default(),
+            priority: Priority::Stable,
             marker: PhantomData,
         }
     }
@@ -209,6 +280,10 @@ impl<C: Context + Sync> Builder<C> {
     }
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self
+    }
+    pub fn priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
         self
     }
     fn check<T>(&self, p: &Port<T>) -> Result<usize, Error> {
@@ -237,9 +312,13 @@ impl<C: Context + Sync> Builder<C> {
             input_types: types,
             output: TypeId::of::<O>(),
             action,
+            dependencies: String::new(),
             condition: None,
             kind,
             budget: None,
+            discardable: false,
+            cost_hint: Duration::ZERO,
+            observed: priority::Observed::default(),
         });
         Ok(Port {
             scope: self.scope.clone(),
@@ -265,7 +344,9 @@ impl<C: Context + Sync> Builder<C> {
             phase,
             vec![dep],
             vec![TypeId::of::<I>()],
-            Arc::new(move |args| Task::Immediate(f(input(&args, 0)).map(|v| Arc::new(v) as Value))),
+            Action::immediate(move |args| {
+                Task::Immediate(f(input(args, 0)).map(|v| Arc::new(v) as Value))
+            }),
             Kind::Work,
         )
     }
@@ -288,8 +369,8 @@ impl<C: Context + Sync> Builder<C> {
             phase,
             vec![dep],
             vec![TypeId::of::<I>()],
-            Arc::new(move |args| {
-                let future = f(input(&args, 0));
+            Action::deferred(move |args| {
+                let future = f(input(args, 0));
                 Task::Deferred(Box::pin(async move {
                     future.await.map(|v| Arc::new(v) as Value)
                 }))
@@ -317,8 +398,8 @@ impl<C: Context + Sync> Builder<C> {
             phase,
             deps,
             vec![TypeId::of::<A>(), TypeId::of::<B>()],
-            Arc::new(move |args| {
-                Task::Immediate(f(input(&args, 0), input(&args, 1)).map(|v| Arc::new(v) as Value))
+            Action::immediate(move |args| {
+                Task::Immediate(f(input(args, 0), input(args, 1)).map(|v| Arc::new(v) as Value))
             }),
             Kind::Work,
         )
@@ -331,14 +412,33 @@ impl<C: Context + Sync> Builder<C> {
         a: &Port<T>,
         b: &Port<T>,
     ) -> Result<Port<T>, Error> {
-        let deps = vec![self.check(a)?, self.check(b)?];
+        self.choice_many(id, phase, &[a.clone(), b.clone()])
+    }
+    /// Join any number of alternatives. Exactly one must produce a value.
+    pub fn choice_many<T: Send + Sync + 'static>(
+        &mut self,
+        id: impl Into<String>,
+        phase: Phase,
+        alternatives: &[Port<T>],
+    ) -> Result<Port<T>, Error> {
+        if alternatives.len() < 2 || alternatives.len() > 256 {
+            return Err(Error::InvalidGraph("invalid_choice_width"));
+        }
+        let deps = alternatives
+            .iter()
+            .map(|port| self.check(port))
+            .collect::<Result<Vec<_>, _>>()?;
+        if deps.iter().copied().collect::<HashSet<_>>().len() != deps.len() {
+            return Err(Error::InvalidGraph("duplicate_choice_input"));
+        }
+        let count = deps.len();
         self.add(
             id,
             phase,
             deps,
-            vec![TypeId::of::<T>(); 2],
-            Arc::new(|args| {
-                let mut active = args.into_iter().take(2).flatten();
+            vec![TypeId::of::<T>(); count],
+            Action::immediate(move |args| {
+                let mut active = args.iter().take(count).flatten().cloned();
                 let first = active.next();
                 Task::Immediate(match (first, active.next()) {
                     (Some(value), None) => Ok(value),
@@ -366,8 +466,8 @@ impl<C: Context + Sync> Builder<C> {
             phase,
             vec![dep],
             vec![TypeId::of::<I>()],
-            Arc::new(move |args| {
-                Task::Immediate(match f(&*input(&args, 0)) {
+            Action::immediate(move |args| {
+                Task::Immediate(match f(&*input(args, 0)) {
                     Decision::Continue => Ok(Arc::new(()) as Value),
                     Decision::Deny { reason, code } => Err(Error::Denied(reason, code)),
                 })
@@ -430,12 +530,32 @@ impl<C: Context + Sync> Builder<C> {
         condition: &Port<bool>,
         expected: bool,
     ) -> Result<(), Error> {
+        self.when_value(node, condition, expected)
+    }
+    /// Select a branch from a typed fact (for example an enum). The fact is read afresh each run.
+    /// Guard every optional producer; an unguarded dependency is still required work.
+    pub fn when_value<T, K>(
+        &mut self,
+        node: &Port<T>,
+        condition: &Port<K>,
+        expected: K,
+    ) -> Result<(), Error>
+    where
+        K: Eq + Send + Sync + 'static,
+    {
         let n = self.check(node)?;
         let d = self.check(condition)?;
         if n == 0 || self.nodes[n].kind == Kind::Gate || self.nodes[n].condition.is_some() {
             return Err(Error::InvalidGraph("conditional_gate_or_duplicate"));
         }
-        self.nodes[n].condition = Some((d, expected));
+        self.nodes[n].condition = Some(Condition {
+            dependency: d,
+            matches: Arc::new(move |value| {
+                value
+                    .downcast_ref::<K>()
+                    .is_some_and(|value| *value == expected)
+            }),
+        });
         if !self.nodes[n].deps.contains(&d) {
             self.nodes[n].deps.push(d);
         }
@@ -449,7 +569,25 @@ impl<C: Context + Sync> Builder<C> {
         self.nodes[n].budget = Some(duration);
         Ok(())
     }
-    pub fn compile(self) -> Result<Flow<C>, Error> {
+    /// Opt in to omitting ordinary work when no requested output or retained control needs it.
+    /// Its action, errors and side effects must be safe to omit. Gates and dispatch cannot opt in.
+    pub fn discardable<T>(&mut self, node: &Port<T>) -> Result<(), Error> {
+        let n = self.check(node)?;
+        if n == 0 || matches!(self.nodes[n].kind, Kind::Gate | Kind::Dispatch) {
+            return Err(Error::InvalidGraph("discardable_control"));
+        }
+        self.nodes[n].discardable = true;
+        Ok(())
+    }
+    pub fn cost_hint<T>(&mut self, node: &Port<T>, cost: Duration) -> Result<(), Error> {
+        let n = self.check(node)?;
+        if n == 0 || cost > Duration::from_secs(120) {
+            return Err(Error::InvalidGraph("invalid_cost_hint"));
+        }
+        self.nodes[n].cost_hint = cost;
+        Ok(())
+    }
+    pub fn compile(mut self) -> Result<Flow<C>, Error> {
         if !(1..=256).contains(&self.limits.max_parallel)
             || !(1..=100000).contains(&self.limits.max_executions)
             || !(1..=100000).contains(&self.limits.max_running_nodes)
@@ -513,12 +651,48 @@ impl<C: Context + Sync> Builder<C> {
                 return Err(Error::InvalidGraph("dispatch_bypasses_mandatory_gate"));
             }
         }
+        let dependencies: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|node| {
+                node.deps
+                    .iter()
+                    .map(|d| self.nodes[*d].id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        for (node, dependencies) in self.nodes.iter_mut().zip(dependencies) {
+            node.dependencies = dependencies;
+        }
+        let mut topology = Topology {
+            dependents: vec![vec![]; self.nodes.len()],
+            guarded: vec![vec![]; self.nodes.len()],
+            gates: vec![],
+            scores: vec![],
+            has_budgets: self.nodes.iter().any(|node| node.budget.is_some()),
+        };
+        for (i, node) in self.nodes.iter().enumerate() {
+            for dependency in &node.deps {
+                topology.dependents[*dependency].push(i);
+            }
+            if let Some(condition) = &node.condition {
+                topology.guarded[condition.dependency].push(i);
+            }
+            if node.kind == Kind::Gate {
+                topology.gates.push(i);
+            }
+        }
+        topology.scores = priority::scores(&self.nodes, &topology, None, false);
         Ok(Flow {
             scope: self.scope,
             nodes: Arc::new(self.nodes),
+            topology,
             limits: self.limits,
             admission: Arc::new(Semaphore::new(self.limits.max_executions)),
             running: Arc::new(Semaphore::new(self.limits.max_running_nodes)),
+            plan_cache: Mutex::new(plans::Cache::default()),
+            priority: self.priority,
             marker: PhantomData,
         })
     }
@@ -526,17 +700,6 @@ impl<C: Context + Sync> Builder<C> {
 impl<C: Context + Sync> Default for Builder<C> {
     fn default() -> Self {
         Self::new()
-    }
-}
-struct NodeTimer {
-    span: tracing::Span,
-    done: bool,
-}
-impl Drop for NodeTimer {
-    fn drop(&mut self) {
-        if !self.done {
-            self.span.record("node.outcome", "cancelled");
-        }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -548,6 +711,29 @@ pub enum Completion {
 impl<C: Context + Sync> Flow<C> {
     /// A synchronous cleanup callback runs on success, failure and cancellation. It cannot replace a denial.
     pub async fn run_finally<F>(&self, context: Arc<C>, finally: F) -> Result<Run, Failure>
+    where
+        F: FnOnce(Completion) + Send,
+    {
+        self.run_finally_selected(context, None, finally).await
+    }
+    pub async fn run_plan_finally<F>(
+        &self,
+        context: Arc<C>,
+        plan: &Prepared,
+        finally: F,
+    ) -> Result<Run, Failure>
+    where
+        F: FnOnce(Completion) + Send,
+    {
+        self.run_finally_selected(context, Some(plan), finally)
+            .await
+    }
+    async fn run_finally_selected<F>(
+        &self,
+        context: Arc<C>,
+        plan: Option<&Prepared>,
+        finally: F,
+    ) -> Result<Run, Failure>
     where
         F: FnOnce(Completion) + Send,
     {
@@ -566,7 +752,7 @@ impl<C: Context + Sync> Flow<C> {
             callback: Some(finally),
             outcome: Completion::Cancelled,
         };
-        let result = self.run(context).await;
+        let result = self.run_selected(context, plan).await;
         guard.outcome = if result.is_ok() {
             Completion::Succeeded
         } else {
@@ -576,6 +762,12 @@ impl<C: Context + Sync> Flow<C> {
     }
 
     pub async fn run(&self, context: Arc<C>) -> Result<Run, Failure> {
+        self.run_selected(context, None).await
+    }
+    pub async fn run_plan(&self, context: Arc<C>, plan: &Prepared) -> Result<Run, Failure> {
+        self.run_selected(context, Some(plan)).await
+    }
+    async fn run_selected(&self, context: Arc<C>, plan: Option<&Prepared>) -> Result<Run, Failure> {
         let deadline: Instant = context.deadline().into();
         let start = Instant::now();
         let mut reports: Vec<_> = self
@@ -587,8 +779,16 @@ impl<C: Context + Sync> Flow<C> {
                 dependency_wait: Duration::ZERO,
                 scheduler_wait: Duration::ZERO,
                 elapsed: Duration::ZERO,
+                skip_reason: None,
+                scheduling: None,
             })
             .collect();
+        if plan.is_some_and(|plan| !plan.belongs_to(self)) {
+            return Err(Failure {
+                error: Error::InvalidGraph("foreign_plan"),
+                nodes: reports,
+            });
+        }
         let _admission = match self.admission.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -601,12 +801,26 @@ impl<C: Context + Sync> Flow<C> {
         let mut values = vec![None; self.nodes.len()];
         values[0] = Some(context as Value);
         reports[0].state = State::Succeeded;
-        let mut pending = self.nodes.len() - 1;
         let mut tasks: FuturesUnordered<Running> = FuturesUnordered::new();
-        let mut ready_at: Vec<Option<Instant>> = vec![None; self.nodes.len()];
+        let mut schedule = Schedule::new(&self.nodes, self.priority == Priority::Measured);
+        let measured_scores = (self.priority == Priority::Measured).then(|| {
+            priority::scores(
+                &self.nodes,
+                &self.topology,
+                plan.map(|plan| plan.active),
+                true,
+            )
+        });
+        let scores = measured_scores.as_deref().unwrap_or_else(|| {
+            plan.map_or(self.topology.scores.as_slice(), |plan| plan.scores.as_ref())
+        });
         let span = tracing::info_span!(
             "workflow.execution",
             workflow.nodes = self.nodes.len() - 1,
+            workflow.branch_checks = tracing::field::Empty,
+            workflow.pruned_nodes = tracing::field::Empty,
+            workflow.prepared = plan.is_some(),
+            workflow.priority = ?self.priority,
             workflow.outcome = tracing::field::Empty
         );
         struct ExecutionGuard(Option<tracing::Span>);
@@ -619,48 +833,38 @@ impl<C: Context + Sync> Flow<C> {
         }
         let mut guard = ExecutionGuard(Some(span.clone()));
         let execution = async {
+            if let Some(plan) = plan {
+                for i in 1..self.nodes.len() {
+                    if !plan.active.contains(i) {
+                        schedule.skip(i, SkipReason::UnrequestedOutput, &mut reports, start);
+                    }
+                }
+            }
+            schedule.complete(0, &self.nodes, &self.topology, &values, &mut reports, start)?;
             loop {
                 if Instant::now() >= deadline {
                     return Err(Error::Deadline);
                 }
-                let mut changed = false;
-                for i in 1..self.nodes.len() {
-                    let node = &self.nodes[i];
-                    if reports[i].state != State::Pending
-                        || node
-                            .deps
-                            .iter()
-                            .any(|d| matches!(reports[*d].state, State::Pending | State::Running))
+                while tasks.len() < self.limits.max_parallel {
+                    if self.topology.has_budgets
+                        && schedule.expire_ready(&self.nodes, &mut reports, start)
                     {
-                        continue;
+                        return Err(Error::Deadline);
                     }
-                    let ready = *ready_at[i].get_or_insert_with(Instant::now);
+                    let Some(i) = schedule.next(self.priority, scores, &self.nodes, deadline)
+                    else {
+                        break;
+                    };
+                    let node = &self.nodes[i];
+                    let ready = schedule.ready_at[i].expect("ready node");
                     reports[i].dependency_wait = ready.duration_since(start);
-                    let skipped = node
-                        .deps
-                        .iter()
-                        .any(|d| reports[*d].state == State::Skipped)
-                        && node.kind != Kind::Choice;
-                    let condition = node.condition.is_none_or(|(d, expected)| {
-                        values[d]
-                            .as_ref()
-                            .and_then(|v| v.downcast_ref::<bool>())
-                            .is_some_and(|v| *v == expected)
-                    });
-                    if skipped || !condition {
-                        reports[i].state = State::Skipped;
-                        pending -= 1;
-                        changed = true;
-                        continue;
-                    }
-                    if tasks.len() >= self.limits.max_parallel {
-                        continue;
-                    }
                     // Choices cannot bypass a mandatory gate through a skipped branch.
                     if node.kind == Kind::Dispatch
-                        && self.nodes.iter().enumerate().any(|(g, n)| {
-                            n.kind == Kind::Gate && reports[g].state != State::Succeeded
-                        })
+                        && self
+                            .topology
+                            .gates
+                            .iter()
+                            .any(|g| reports[*g].state != State::Succeeded)
                     {
                         return Err(Error::Denied(
                             Reason::Forbidden,
@@ -668,121 +872,100 @@ impl<C: Context + Sync> Flow<C> {
                         ));
                     }
                     reports[i].state = State::Running;
-                    pending -= 1;
-                    changed = true;
-                    let args = node.deps.iter().map(|d| values[*d].clone()).collect();
-                    let action = node.action.clone();
-                    let semaphore = self.running.clone();
-                    let end = node.budget.map_or(deadline, |d| deadline.min(ready + d));
-                    let dependencies = node
-                        .deps
-                        .iter()
-                        .map(|d| self.nodes[*d].id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",");
+                    schedule.pending -= 1;
+                    let inline_permit = if node.action.immediate {
+                        self.running.clone().try_acquire_owned().ok()
+                    } else {
+                        None
+                    };
+                    let scheduling = if inline_permit.is_some() {
+                        Scheduling::Inline
+                    } else if tasks.is_empty() && schedule.ready.is_empty() {
+                        Scheduling::Serial
+                    } else {
+                        Scheduling::Parallel
+                    };
+                    reports[i].scheduling = Some(scheduling);
                     let node_span = tracing::info_span!(
                         "workflow.node", node.id = %node.id, node.phase = ?node.phase,
-                        node.dependencies = %dependencies, node.outcome = tracing::field::Empty,
+                        node.dependencies = %node.dependencies, node.scheduling = ?scheduling,
+                        node.remaining_cost_ns = scores[i],
+                        node.outcome = tracing::field::Empty,
                         node.scheduler_wait_ns = tracing::field::Empty,
                         node.dependency_wait_ns = ready.duration_since(start).as_nanos().min(u64::MAX as u128) as u64,
                         node.execution_ns = tracing::field::Empty
                     );
-                    let instrumentation = node_span.clone();
-                    let timer = NodeTimer {
-                        span: node_span.clone(),
-                        done: false,
+                    let step = Step {
+                        index: i,
+                        ready,
+                        end: node.budget.map_or(deadline, |d| deadline.min(ready + d)),
+                        args: Arguments::new(node, &values),
+                        action: node.action.clone(),
+                        semaphore: self.running.clone(),
+                        timer: NodeTimer {
+                            span: node_span.clone(),
+                            done: false,
+                            ready,
+                            started: None,
+                        },
                     };
-                    tasks.push(Box::pin(
-                        async move {
-                            let mut timer = timer;
-                            let mut execution_start = None;
-                            let execute = async {
-                                let _permit = semaphore
-                                    .acquire_owned()
-                                    .await
-                                    .map_err(|_| Error::Overloaded)?;
-                                // Budgets also include waiting for this flow's parallel slots.
-                                if Instant::now() >= end {
-                                    return Err(Error::Deadline);
-                                }
-                                execution_start = Some(Instant::now());
-                                action(args).resolve().await
-                            };
-                            let value =
-                                match timeout_at(end, AssertUnwindSafe(execute).catch_unwind())
-                                    .await
-                                {
-                                    Ok(Ok(result)) => result,
-                                    Ok(Err(_)) => Err(Error::Panic),
-                                    Err(_) => Err(Error::Deadline),
-                                };
-                            let scheduler_wait = execution_start
-                                .map_or_else(|| ready.elapsed(), |s| s.duration_since(ready));
-                            let elapsed = execution_start.map_or(Duration::ZERO, |s| s.elapsed());
-                            node_span.record(
-                                "node.scheduler_wait_ns",
-                                scheduler_wait.as_nanos().min(u64::MAX as u128) as u64,
-                            );
-                            node_span.record(
-                                "node.execution_ns",
-                                elapsed.as_nanos().min(u64::MAX as u128) as u64,
-                            );
-                            node_span.record(
-                                "node.outcome",
-                                value.as_ref().map_or_else(|e| e.outcome(), |_| "succeeded"),
-                            );
-                            timer.done = true;
-                            (i, scheduler_wait, elapsed, value)
-                        }
-                        .instrument(instrumentation),
-                    ));
+                    let completed = if let Some(permit) = inline_permit {
+                        node_span.in_scope(|| step.inline(permit))
+                    } else if scheduling == Scheduling::Serial {
+                        step.run().instrument(node_span).await
+                    } else {
+                        tasks.push(Box::pin(step.run().instrument(node_span)));
+                        continue;
+                    };
+                    accept(
+                        completed,
+                        &mut schedule,
+                        &self.nodes,
+                        &self.topology,
+                        &mut values,
+                        &mut reports,
+                        start,
+                    )?;
                 }
-                if pending == 0 && tasks.is_empty() {
+                if schedule.pending == 0 && tasks.is_empty() {
                     return Ok(());
                 }
-                if tasks.is_empty() && !changed {
+                if tasks.is_empty() {
                     return Err(Error::InvalidGraph("unreachable_nodes"));
                 }
                 // A ready node's budget must expire even while a sibling occupies the last slot.
-                let waiting_deadline = self
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| reports[*i].state == State::Pending)
-                    .filter_map(|(i, n)| Some(ready_at[i]? + n.budget?))
-                    .min()
-                    .unwrap_or(deadline)
-                    .min(deadline);
+                let waiting_deadline = if self.topology.has_budgets {
+                    // timeout_at polls its future before checking the timer. Reject a known
+                    // expiration before polling work that could otherwise have side effects.
+                    if schedule.expire_ready(&self.nodes, &mut reports, start) {
+                        return Err(Error::Deadline);
+                    }
+                    schedule
+                        .ready
+                        .iter()
+                        .filter_map(|i| Some(schedule.ready_at[i]? + self.nodes[i].budget?))
+                        .min()
+                        .unwrap_or(deadline)
+                        .min(deadline)
+                } else {
+                    deadline
+                };
                 match timeout_at(waiting_deadline, tasks.next()).await {
-                    Ok(Some((i, scheduler_wait, elapsed, value))) => {
-                        reports[i].scheduler_wait = scheduler_wait;
-                        reports[i].elapsed = elapsed;
-                        match value {
-                            Ok(value) => {
-                                values[i] = Some(value);
-                                reports[i].state = State::Succeeded;
-                            }
-                            Err(error) => {
-                                reports[i].state = State::Failed;
-                                return Err(error);
-                            }
-                        }
+                    Ok(Some(completed)) => {
+                        accept(
+                            completed,
+                            &mut schedule,
+                            &self.nodes,
+                            &self.topology,
+                            &mut values,
+                            &mut reports,
+                            start,
+                        )?;
                     }
                     Ok(None) => {}
                     Err(_) => {
-                        for (i, node) in self.nodes.iter().enumerate() {
-                            if reports[i].state == State::Pending
-                                && ready_at[i].is_some_and(|ready| {
-                                    node.budget
-                                        .is_some_and(|budget| ready + budget <= Instant::now())
-                                })
-                            {
-                                reports[i].state = State::Failed;
-                                reports[i].scheduler_wait = ready_at[i].expect("ready").elapsed();
-                                tracing::warn!(node.id = %node.id, node.outcome = "timed_out",
-                                    node.scheduler_wait_ns = reports[i].scheduler_wait.as_nanos().min(u64::MAX as u128) as u64,
-                                    "workflow scheduler budget expired");
-                            }
+                        if self.topology.has_budgets {
+                            schedule.expire_ready(&self.nodes, &mut reports, start);
                         }
                         return Err(Error::Deadline);
                     }
@@ -793,6 +976,8 @@ impl<C: Context + Sync> Flow<C> {
         // Dropping sibling futures closes scopes and releases cooperative resources; no detached tasks.
         drop(tasks);
         guard.0 = None;
+        span.record("workflow.branch_checks", schedule.branch_checks as u64);
+        span.record("workflow.pruned_nodes", schedule.pruned as u64);
         match result {
             Ok(()) => {
                 span.record("workflow.outcome", "succeeded");

@@ -38,6 +38,11 @@ pub struct Config {
     pub async_policies: Vec<AsyncPolicy>,
     #[serde(default = "default_parallel_threshold")]
     pub async_parallel_threshold: usize,
+    #[serde(default = "default_async_parallel")]
+    pub async_max_parallel: usize,
+    #[serde(default)]
+    pub async_priority: AsyncPriority,
+    pub async_profile: Option<AsyncProfile>,
     pub auth: Option<wayframe::auth::Config>,
     #[serde(default)]
     pub admins: Vec<AdminConfig>,
@@ -99,6 +104,64 @@ pub struct AsyncPolicy {
     pub operations: Vec<String>,
     #[serde(default)]
     pub targets: Vec<String>,
+    #[serde(default)]
+    pub estimated_ms: u64,
+}
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsyncPriority {
+    #[default]
+    Stable,
+    CriticalPath,
+    Measured,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AsyncProfile {
+    pub capacity: usize,
+    pub min_samples: u64,
+    pub explore_every: u64,
+    pub improvement_percent: u64,
+    pub ttl_seconds: u64,
+    pub min_budget_ms: u64,
+}
+impl Default for AsyncProfile {
+    fn default() -> Self {
+        Self {
+            capacity: 64,
+            min_samples: 8,
+            explore_every: 64,
+            improvement_percent: 10,
+            ttl_seconds: 60,
+            min_budget_ms: 10,
+        }
+    }
+}
+impl AsyncProfile {
+    pub fn settings(&self) -> Result<wayframe::adaptive::ProfileSettings> {
+        let settings = wayframe::adaptive::ProfileSettings {
+            capacity: self.capacity,
+            min_samples: self.min_samples,
+            explore_every: self.explore_every,
+            improvement_percent: self.improvement_percent,
+            ttl: Duration::from_secs(self.ttl_seconds),
+            min_budget: Duration::from_millis(self.min_budget_ms),
+        };
+        settings.validate()?;
+        Ok(settings)
+    }
+}
+impl AsyncPriority {
+    pub fn priority(self) -> wayframe::flow::Priority {
+        match self {
+            Self::Stable => wayframe::flow::Priority::Stable,
+            Self::CriticalPath => wayframe::flow::Priority::CriticalPath,
+            Self::Measured => wayframe::flow::Priority::Measured,
+        }
+    }
+}
+fn default_async_parallel() -> usize {
+    16
 }
 fn default_parallel_threshold() -> usize {
     2
@@ -240,6 +303,9 @@ impl Config {
             upstream_http2: false,
             load_balancer: None,
             async_policies: vec![],
+            async_max_parallel: default_async_parallel(),
+            async_priority: AsyncPriority::Stable,
+            async_profile: None,
             async_parallel_threshold: 2,
             auth: None,
             admins: vec![],
@@ -281,7 +347,18 @@ impl Config {
             (2..=16).contains(&self.async_parallel_threshold) && self.async_policies.len() <= 16,
             "invalid adaptive policy bounds"
         );
+        ensure!(
+            (1..=16).contains(&self.async_max_parallel),
+            "invalid async parallel capacity"
+        );
+        if let Some(profile) = &self.async_profile {
+            profile.settings()?;
+        }
         for policy in &self.async_policies {
+            ensure!(
+                policy.estimated_ms <= 120000,
+                "invalid external policy cost hint"
+            );
             ensure!(
                 policy.operations.len() <= 32
                     && policy.targets.len() <= 256
