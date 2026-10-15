@@ -16,7 +16,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
@@ -25,10 +25,12 @@ jobs:
         run: python3 -m pip install -r requirements-dev.txt
       - name: Install Rust toolchain components
         run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/wayframe-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
           rustup show active-toolchain
       - name: Verify source, libraries, optional plugins, and live gateway
         run: bash scripts/verify.sh
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-tools
           key: wasm-tools-${{ runner.os }}-1.261.0

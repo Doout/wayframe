@@ -9,6 +9,7 @@ import secrets
 import ssl
 import sys
 import threading
+import time
 import unittest
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,6 +53,108 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
             return await http.post(
                 services.gateway, headers=modern_headers(services.tokens[role], tool), json=value
             )
+
+    async def test_measured_paths_with_slow_tls_policies_keep_fresh_denials(self):
+        services = self.prepare(tls=True)
+        receiver = Receiver()
+        self.addCleanup(receiver.close)
+        calls = []
+        lock = threading.Lock()
+
+        class Policy(BaseHTTPRequestHandler):
+            deny = False
+
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                with lock:
+                    calls.append(self.path)
+                time.sleep(0.08)
+                body = json.dumps(
+                    {
+                        "version": 1,
+                        "request_id": request["request_id"],
+                        "status": 403 if self.deny else 0,
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", free_port()), Policy)
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(services.server_certificate, services.key)
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        config = (
+            'async_max_parallel=2\nasync_priority="measured"\nasync_profile={min_samples=4,explore_every=64}\n'
+            + services.config.read_text()
+        )
+        for i in range(4):
+            env = f"SLOW_POLICY_{i}"
+            services.env[env] = secrets.token_hex(32)
+            config += f'\n[[async_policies]]\nid="slow-{i}"\nurl="https://127.0.0.1:{server.server_port}/{i}"\ntoken_env="{env}"\nca={json.dumps(str(services.certificate))}\ntimeout_ms=3000\nestimated_ms=80\n'
+        services.config.write_text(config)
+        services.env.update(
+            OTEL_EXPORTER_OTLP_ENDPOINT=receiver.endpoint,
+            OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf",
+            OTEL_TRACES_SAMPLER="always_on",
+            OTEL_BSP_SCHEDULE_DELAY="100",
+        )
+        await services.start()
+        for i in range(9):
+            result = await self.call(services, "admin_preview", role="operator", identifier=i + 1)
+            self.assertEqual(result.status_code, 200, result.text)
+        metrics = await self.request(services, "GET", "/metrics", token=services.tokens["operator"])
+        self.assertEqual(metrics.status_code, 200)
+        profile = metrics.json()["adaptive"]["profile"]
+        self.assertEqual(profile["classes"], 1)
+        self.assertEqual(profile["successes"], 9)
+        self.assertEqual(metrics.json()["adaptive"]["linear_selections"], 4)
+        self.assertEqual(metrics.json()["adaptive"]["graph_selections"], 5)
+        self.assertEqual(len(calls), 36)
+        await asyncio.sleep(0.3)
+        selected = next(
+            s
+            for s in receiver.spans()
+            if s["name"] == "workflow.select"
+            and s["trace_id"] == result.headers["x-wayframe-trace-id"]
+        )
+        self.assertEqual(selected["attributes"]["selection.reason"], "MeasuredCost")
+        self.assertEqual(selected["attributes"]["execution.path"], "graph")
+        Policy.deny = True
+        denied = await self.call(services, "admin_preview", role="operator")
+        self.assertEqual(denied.status_code, 403)
+        metrics = await self.request(services, "GET", "/metrics", token=services.tokens["operator"])
+        self.assertEqual(metrics.json()["adaptive"]["profile"]["failures"], 1)
+        self.assertEqual(metrics.json()["adaptive"]["linear_selections"], 4)
+
+    async def test_profile_and_scheduler_bounds_reject_reload_without_publication(self):
+        services = self.prepare()
+        await services.start()
+        config = services.config.read_text()
+        for settings in [
+            "async_profile={capacity=0}",
+            "async_profile={min_samples=1}",
+            "async_profile={ttl_seconds=0}",
+            "async_max_parallel=17",
+            'async_priority="unknown"',
+        ]:
+            services.config.write_text(settings + "\n" + config)
+            rejected = await self.request(services, "POST", "/admin/reload", revision=1)
+            self.assertEqual(rejected.status_code, 400, rejected.text)
+        services.config.write_text(config)
+        live = await self.call(services, "admin_preview", role="operator")
+        self.assertEqual(live.status_code, 200)
 
     async def test_reload_schema_rollback_and_stale_generation(self):
         services = self.prepare()
@@ -226,12 +329,14 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         config = services.config.read_text()
-        for name in ("a", "b"):
+        for name in ("a", "b", "c"):
             env = f"POLICY_{name.upper()}"
             services.env[env] = secrets.token_hex(32)
             config += f'\n[[async_policies]]\nid="policy-{name}"\nurl="https://127.0.0.1:{server.server_port}/{name}"\ntoken_env="{env}"\nca={json.dumps(str(services.certificate))}\ntimeout_ms=3000\n'
             if name == "b":
                 config += 'targets=["admin_preview","put_note"]\n'
+            if name == "c":
+                config += 'targets=["unused-target"]\n'
         services.config.write_text(config)
         services.env.update(
             OTEL_EXPORTER_OTLP_ENDPOINT=receiver.endpoint,
@@ -270,6 +375,24 @@ class Extensions(unittest.IsolatedAsyncioTestCase):
         a, b = by_name["policy-a"], by_name["policy-b"]
         self.assertLess(max(a["start_ns"], b["start_ns"]), min(a["end_ns"], b["end_ns"]))
         self.assertIn("node.execution_ns", a["attributes"])
+        first_nodes = [s for s in nodes if s["trace_id"] == first_trace]
+        inactive = next(s for s in first_nodes if s["attributes"].get("node.id") == "policy-c")
+        self.assertEqual(inactive["attributes"]["node.outcome"], "skipped")
+        self.assertEqual(int(inactive["attributes"]["node.execution_ns"]), 0)
+        gate = next(s for s in first_nodes if s["attributes"].get("node.id") == "policy-2-gate")
+        self.assertEqual(gate["attributes"]["node.outcome"], "succeeded")
+        execution = next(
+            s
+            for s in receiver.spans()
+            if s["name"] == "workflow.execution" and s["trace_id"] == first_trace
+        )
+        self.assertEqual(int(execution["attributes"]["workflow.pruned_nodes"]), 4)
+        unused_join = next(
+            s for s in first_nodes if s["attributes"].get("node.id") == "policy-join"
+        )
+        self.assertEqual(unused_join["attributes"]["node.skip_reason"], "UnrequestedOutput")
+        self.assertTrue(execution["attributes"]["workflow.prepared"])
+        self.assertEqual(a["attributes"]["node.scheduling"], "Parallel")
         selected = [
             s
             for s in receiver.spans()
