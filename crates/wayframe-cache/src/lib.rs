@@ -229,6 +229,18 @@ impl<T: Send + Sync + 'static> Cache<T> {
             .map_err(|_| anyhow::anyhow!("cache poisoned"))?;
         Ok(Self::remove_branch(&mut s, key))
     }
+    /// Advisory presence only: neither returns a value nor validates evidence or
+    /// dependencies. Recheck after acquiring singleflight when choosing a load;
+    /// reuse still requires `lookup` with freshly obtained evidence.
+    pub fn may_contain(&self, key: &Key) -> Result<bool> {
+        let s = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cache poisoned"))?;
+        Ok(s.entries
+            .get(key)
+            .is_some_and(|entry| entry.until > Instant::now()))
+    }
     pub fn get(&self, key: &Key) -> Result<Option<Arc<T>>> {
         let mut s = self
             .state

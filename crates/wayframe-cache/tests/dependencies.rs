@@ -22,6 +22,63 @@ fn evidence(version: &str) -> Evidence {
     Evidence::new(BTreeMap::from([("resource".into(), version.into())])).unwrap()
 }
 #[test]
+fn presence_is_advisory_and_does_not_discard_stateful_entries() {
+    let cache = Cache::new(8, 65536, 2).unwrap();
+    assert!(!cache.may_contain(&key("read")).unwrap());
+    cache
+        .retain(
+            key("read"),
+            42,
+            8,
+            Duration::from_secs(60),
+            &[],
+            evidence("1"),
+        )
+        .unwrap();
+    assert!(cache.may_contain(&key("read")).unwrap());
+    let mut other = key("read");
+    other.subject = "other-user".into();
+    assert!(!cache.may_contain(&other).unwrap());
+    assert_eq!(
+        *cache
+            .lookup(&key("read"), &[], &evidence("1"))
+            .unwrap()
+            .unwrap()
+            .value,
+        42
+    );
+    // A positive hint cannot authorize a result with changed remote evidence.
+    assert!(cache
+        .lookup(&key("read"), &[], &evidence("2"))
+        .unwrap()
+        .is_none());
+    assert!(!cache.may_contain(&key("read")).unwrap());
+}
+
+#[tokio::test]
+async fn presence_excludes_expired_entries_without_returning_or_pruning_them() {
+    let cache = Cache::new(8, 65536, 2).unwrap();
+    cache
+        .retain(
+            key("read"),
+            42,
+            8,
+            Duration::from_millis(100),
+            &[],
+            evidence("1"),
+        )
+        .unwrap();
+    assert!(cache.may_contain(&key("read")).unwrap());
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(!cache.may_contain(&key("read")).unwrap());
+    assert_eq!(cache.stats().unwrap()["entries"], 1);
+    assert!(cache
+        .lookup(&key("read"), &[], &evidence("1"))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn changed_witness_invalidates_diamond_but_preserves_independent_branch() {
     let cache = Cache::new(32, 65536, 4).unwrap();
     let ttl = Duration::from_secs(60);
