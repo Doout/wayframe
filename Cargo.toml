@@ -42,7 +42,7 @@ tracing-opentelemetry = "0.34"
 rand = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Wasm is disabled by default; keep the runtime and component ABI compatible.
-wasmtime = { version = "=49.0.2", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "pooling-allocator", "runtime", "std", "wat"] }
+wasmtime = { version = "=49.0.3", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "pooling-allocator", "runtime", "std", "wat"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
