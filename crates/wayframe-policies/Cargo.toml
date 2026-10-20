@@ -16,7 +16,7 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 http.workspace = true
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.59", default-features = false }
 wayframe-cache = { path = "../wayframe-cache" }
 wayframe-lb = { path = "../wayframe-lb" }
 wayframe-routing = { path = "../wayframe-routing" }
